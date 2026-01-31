@@ -1,0 +1,4 @@
+# ninja log v7
+8	3955	1769860128879589900	/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/build/temp.linux-x86_64-cpython-38/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/src/cpu/ms_deform_attn_cpu.o	6aea151a58122914
+16	8608	1769860128890171800	/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/build/temp.linux-x86_64-cpython-38/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/src/vision.o	c5a7b1aa6af2075
+12	10650	1769860128884605900	/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/build/temp.linux-x86_64-cpython-38/mnt/d/Tri_modal_temp_code/TransVOD-master_v3/models/ops/src/cuda/ms_deform_attn_cuda.o	8e16c627cee240b1
