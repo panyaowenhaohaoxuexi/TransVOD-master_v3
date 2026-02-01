@@ -39,6 +39,14 @@ def run_singlebaseline():
     args.coco_pretrain = True
     args.resume = COCO_PRETRAIN
 
+
+    # Top-K (two-stage) + tri-modal decoder
+    args.two_stage = True
+    args.trimodal_decoder = True
+    args.trimodal_fusion = "gated"      # "avg" / "gated" / "concat"
+    args.init_query_from_features = True  # 建议 True，更贴近 DAMSDet CQS
+
+
     # output
     args.output_dir = "exps/singlebaseline/mydata_r50_singleScale_dc5_3m_stage1"
     os.makedirs(args.output_dir, exist_ok=True)

@@ -172,17 +172,40 @@ class DeformableDETR(nn.Module):
             srcs, masks, pos = self._backbone_to_transformer_inputs(samples)
 
         # ---------- 2) 三模态：切分 -> 各自走同一个 backbone（共享权重） ----------
+## 原始
+        # elif c == 9:
+        #     vis_s, ir_s, sar_s = self._split_trimodal_single(samples)
+
+        #     srcs_vis, masks_vis, pos_vis = self._backbone_to_transformer_inputs(vis_s)
+        #     srcs_ir,  _m2,      _p2     = self._backbone_to_transformer_inputs(ir_s)
+        #     srcs_sar, _m3,      _p3     = self._backbone_to_transformer_inputs(sar_s)
+
+        #     # 先用“临时融合”让现有 transformer 能跑通（后续你会替换为真正的三模态/时序模块）
+        #     srcs = []
+        #     masks = masks_vis
+        #     pos = pos_vis
+
+
+
         elif c == 9:
             vis_s, ir_s, sar_s = self._split_trimodal_single(samples)
 
             srcs_vis, masks_vis, pos_vis = self._backbone_to_transformer_inputs(vis_s)
-            srcs_ir,  _m2,      _p2     = self._backbone_to_transformer_inputs(ir_s)
-            srcs_sar, _m3,      _p3     = self._backbone_to_transformer_inputs(sar_s)
+            srcs_ir,  _,       _       = self._backbone_to_transformer_inputs(ir_s)
+            srcs_sar, _,       _       = self._backbone_to_transformer_inputs(sar_s)
 
-            # 先用“临时融合”让现有 transformer 能跑通（后续你会替换为真正的三模态/时序模块）
-            srcs = []
-            masks = masks_vis
-            pos = pos_vis
+            if getattr(self.transformer, 'is_trimodal', False):
+                # trimodal transformer expects 3 streams
+                srcs = (srcs_vis, srcs_ir, srcs_sar)
+                masks = masks_vis
+                pos = pos_vis
+            else:
+                # fallback baseline: mean fusion
+                srcs = [(srcs_vis[l] + srcs_ir[l] + srcs_sar[l]) / 3.0 for l in range(len(srcs_vis))]
+                masks = masks_vis
+                pos = pos_vis
+
+
             for l in range(len(srcs_vis)):
                 srcs.append((srcs_vis[l] + srcs_ir[l] + srcs_sar[l]) / 3.0)
 
@@ -199,8 +222,17 @@ class DeformableDETR(nn.Module):
         if not self.two_stage:
             query_embeds = self.query_embed.weight
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(srcs, masks, pos, query_embeds)
+        #  # 原始
+        # hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+        #     self.transformer(srcs, masks, pos, query_embeds)
+        
+        if isinstance(srcs, tuple):  # (vis, ir, sar)
+            hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+                self.transformer(srcs[0], srcs[1], srcs[2], masks, pos, query_embeds)
+        else:
+            hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+                self.transformer(srcs, masks, pos, query_embeds)
+
 
         outputs_classes = []
         outputs_coords = []
@@ -564,7 +596,10 @@ class MLP(nn.Module):
 
 def build(args):
 
-    num_classes = 31
+## 原始
+    # num_classes = 31
+    num_classes = args.num_classes
+
     device = torch.device(args.device)
 
     backbone = build_backbone(args)

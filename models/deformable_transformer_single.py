@@ -414,6 +414,267 @@ class DeformableTransformerDecoder(nn.Module):
         return output, reference_points
 
 
+
+class TriModalDeformableTransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model=256, d_ffn=1024,
+                 dropout=0.1, activation="relu",
+                 n_levels=4, n_heads=8, n_points=4,
+                 fusion='avg'):
+        super().__init__()
+        self.fusion = fusion
+
+        # shared cross-attn (weights shared across modalities)
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # self-attn
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # fusion params
+        if fusion == 'gated':
+            self.gate = nn.Linear(d_model, 3)
+        elif fusion == 'concat':
+            self.fuse = nn.Linear(d_model * 3, d_model)
+
+        # ffn
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout3 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout4(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def _fuse(self, tgt, a, b, c):
+        if self.fusion == 'avg':
+            return (a + b + c) / 3.0
+        if self.fusion == 'gated':
+            w = torch.softmax(self.gate(tgt), dim=-1)  # [B,Q,3]
+            return w[..., 0:1] * a + w[..., 1:2] * b + w[..., 2:3] * c
+        if self.fusion == 'concat':
+            return self.fuse(torch.cat([a, b, c], dim=-1))
+        raise ValueError(f"Unknown fusion: {self.fusion}")
+
+    def forward(self, tgt, query_pos, reference_points,
+                srcs, src_spatial_shapes, level_start_index, src_padding_masks=None):
+        # srcs: (vis_mem, ir_mem, sar_mem)
+        # src_padding_masks: (vis_mask, ir_mask, sar_mask)
+        vis_mem, ir_mem, sar_mem = srcs
+        if src_padding_masks is None:
+            vis_mask = ir_mask = sar_mask = None
+        else:
+            vis_mask, ir_mask, sar_mask = src_padding_masks
+
+        # self attention
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # tri-modal cross attention (query-side fusion)
+        q_in = self.with_pos_embed(tgt, query_pos)
+        out_vis = self.cross_attn(q_in, reference_points, vis_mem, src_spatial_shapes, level_start_index, vis_mask)
+        out_ir  = self.cross_attn(q_in, reference_points, ir_mem,  src_spatial_shapes, level_start_index, ir_mask)
+        out_sar = self.cross_attn(q_in, reference_points, sar_mem, src_spatial_shapes, level_start_index, sar_mask)
+        fused = self._fuse(tgt, out_vis, out_ir, out_sar)
+
+        tgt = tgt + self.dropout1(fused)
+        tgt = self.norm1(tgt)
+
+        # ffn
+        tgt = self.forward_ffn(tgt)
+        return tgt
+
+
+class TriModalDeformableTransformerDecoder(nn.Module):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.return_intermediate = return_intermediate
+        # for iterative refinement / two-stage hooks (same names as original)
+        self.bbox_embed = None
+        self.class_embed = None
+
+    def forward(self, tgt, reference_points, srcs, src_spatial_shapes, src_level_start_index, src_valid_ratios,
+                query_pos=None, src_padding_masks=None):
+        output = tgt
+        intermediate = []
+        intermediate_reference_points = []
+
+        for lid, layer in enumerate(self.layers):
+            if reference_points.shape[-1] == 4:
+                reference_points_input = reference_points[:, :, None] * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
+            else:
+                reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
+
+            output = layer(output, query_pos, reference_points_input, srcs,
+                           src_spatial_shapes, src_level_start_index, src_padding_masks)
+
+            # iterative bbox refinement (same logic)
+            if self.bbox_embed is not None:
+                tmp = self.bbox_embed[lid](output)
+                if reference_points.shape[-1] == 4:
+                    new_reference_points = (tmp + inverse_sigmoid(reference_points)).sigmoid()
+                else:
+                    new_reference_points = tmp
+                    new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
+                    new_reference_points = new_reference_points.sigmoid()
+                reference_points = new_reference_points.detach()
+
+            if self.return_intermediate:
+                intermediate.append(output)
+                intermediate_reference_points.append(reference_points)
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+        return output, reference_points
+
+
+
+class TriModalDeformableTransformer(DeformableTransformer):
+    """
+    - 3 encoders forward (weights shared) => M_vis, M_ir, M_sar
+    - Top-K selection on concatenated encoder tokens (DAMSDet-style two-stage)
+    - tri-modal decoder cross-attn, fusion on query side
+    """
+    def __init__(self, *args, fusion='avg', init_query_from_features=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_trimodal = True
+        self.init_query_from_features = init_query_from_features
+
+        # replace decoder
+        decoder_layer = TriModalDeformableTransformerDecoderLayer(
+            d_model=self.d_model,
+            d_ffn=kwargs.get('dim_feedforward', 1024),
+            dropout=kwargs.get('dropout', 0.1),
+            activation=kwargs.get('activation', 'relu'),
+            n_levels=kwargs.get('num_feature_levels', 4),
+            n_heads=kwargs.get('nhead', 8),
+            n_points=kwargs.get('dec_n_points', 4),
+            fusion=fusion
+        )
+        self.decoder = TriModalDeformableTransformerDecoder(
+            decoder_layer,
+            kwargs.get('num_decoder_layers', 6),
+            kwargs.get('return_intermediate_dec', False)
+        )
+        self._reset_parameters()
+
+    def _prepare(self, srcs, masks, pos_embeds):
+        src_flatten, mask_flatten, lvl_pos_embed_flatten, spatial_shapes = [], [], [], []
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
+            bs, c, h, w = src.shape
+            spatial_shapes.append((h, w))
+            src = src.flatten(2).transpose(1, 2)
+            mask = mask.flatten(1)
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+            src_flatten.append(src)
+            mask_flatten.append(mask)
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
+
+        src_flatten = torch.cat(src_flatten, 1)
+        mask_flatten = torch.cat(mask_flatten, 1)
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+        return src_flatten, mask_flatten, lvl_pos_embed_flatten, spatial_shapes, level_start_index, valid_ratios
+
+    def forward(self, srcs_vis, srcs_ir, srcs_sar, masks, pos_embeds, query_embed=None):
+        assert self.two_stage, "Stage1 trimodal version is intended to run with --two_stage (Top-K)."
+
+        # prepare encoder inputs per modality
+        sv, mv, pv, spatial_shapes, level_start_index, valid_ratios = self._prepare(srcs_vis, masks, pos_embeds)
+        si, mi, pi, _, _, _ = self._prepare(srcs_ir,  masks, pos_embeds)
+        ss, ms, ps, _, _, _ = self._prepare(srcs_sar, masks, pos_embeds)
+
+        # encoder (weights shared, forward 3 times)
+        mem_vis = self.encoder(sv, spatial_shapes, level_start_index, valid_ratios, pv, mv)
+        mem_ir  = self.encoder(si, spatial_shapes, level_start_index, valid_ratios, pi, mi)
+        mem_sar = self.encoder(ss, spatial_shapes, level_start_index, valid_ratios, ps, ms)
+
+        # --- two-stage Top-K selection on concatenated tokens ---
+        out_vis, prop_vis = self.gen_encoder_output_proposals(mem_vis, mv, spatial_shapes)
+        out_ir,  prop_ir  = self.gen_encoder_output_proposals(mem_ir,  mi, spatial_shapes)
+        out_sar, prop_sar = self.gen_encoder_output_proposals(mem_sar, ms, spatial_shapes)
+
+        output_memory = torch.cat([out_vis, out_ir, out_sar], dim=1)          # [B, 3S, C]
+        output_props  = torch.cat([prop_vis, prop_ir, prop_sar], dim=1)       # [B, 3S, 4]
+        output_mask   = torch.cat([mv, mi, ms], dim=1)                        # [B, 3S]
+
+        # proposal heads come from DeformableDETR's hack: transformer.decoder.class_embed/bbox_embed
+        enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+        enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_props
+
+        # DAMSDet-style score: max over classes
+        topk = self.two_stage_num_proposals
+        scores = enc_outputs_class.max(-1)[0]  # [B, 3S]
+        scores = scores.masked_fill(output_mask, float('-inf'))
+        topk_proposals = torch.topk(scores, topk, dim=1)[1]  # [B, K]
+
+        topk_coords_unact = torch.gather(
+            enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+        ).detach()
+        reference_points = topk_coords_unact.sigmoid()
+        init_reference_out = reference_points
+
+        pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
+        query_pos, tgt_from_pos = torch.split(pos_trans_out, self.d_model, dim=2)
+
+        if self.init_query_from_features:
+            tgt = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+            tgt = tgt.detach()
+        else:
+            tgt = tgt_from_pos
+
+        # tri-modal decoder
+        hs, inter_references = self.decoder(
+            tgt, reference_points,
+            (mem_vis, mem_ir, mem_sar),
+            spatial_shapes, level_start_index, valid_ratios,
+            query_pos=query_pos,
+            src_padding_masks=(mv, mi, ms)
+        )
+        inter_references_out = inter_references
+        return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
@@ -429,7 +690,45 @@ def _get_activation_fn(activation):
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
 
+# 原始
+# def build_deforamble_transformer(args):
+#     return DeformableTransformer(
+#         d_model=args.hidden_dim,
+#         nhead=args.nheads,
+#         num_encoder_layers=args.enc_layers,
+#         num_decoder_layers=args.dec_layers,
+#         dim_feedforward=args.dim_feedforward,
+#         dropout=args.dropout,
+#         activation="relu",
+#         return_intermediate_dec=True,
+#         num_feature_levels=args.num_feature_levels,
+#         dec_n_points=args.dec_n_points,
+#         enc_n_points=args.enc_n_points,
+#         two_stage=args.two_stage,
+#         two_stage_num_proposals=args.num_queries)
+
+
+
 def build_deforamble_transformer(args):
+    if getattr(args, 'trimodal_decoder', False):
+        return TriModalDeformableTransformer(
+            d_model=args.hidden_dim,
+            nhead=args.nheads,
+            num_encoder_layers=args.enc_layers,
+            num_decoder_layers=args.dec_layers,
+            dim_feedforward=args.dim_feedforward,
+            dropout=args.dropout,
+            activation="relu",
+            return_intermediate_dec=True,
+            num_feature_levels=args.num_feature_levels,
+            dec_n_points=args.dec_n_points,
+            enc_n_points=args.enc_n_points,
+            two_stage=True,
+            two_stage_num_proposals=args.num_queries,
+            fusion=getattr(args, 'trimodal_fusion', 'avg'),
+            init_query_from_features=getattr(args, 'init_query_from_features', False),
+        )
+
     return DeformableTransformer(
         d_model=args.hidden_dim,
         nhead=args.nheads,
@@ -444,5 +743,8 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         two_stage_num_proposals=args.num_queries)
+
+
+
 
 

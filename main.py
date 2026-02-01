@@ -397,6 +397,19 @@ def get_args_parser():
     parser.add_argument('--with_box_refine', default=False, action='store_true')
     parser.add_argument('--two_stage', default=False, action='store_true')
 
+## 修改
+    parser.add_argument('--trimodal_decoder', default=False, action='store_true',
+                        help='use tri-modal query-fusion decoder for (VIS/IR/SAR)')
+    parser.add_argument('--trimodal_fusion', default='avg', type=str,
+                        choices=['avg', 'gated', 'concat'],
+                        help='fusion type on query side')
+    parser.add_argument('--init_query_from_features', default=False, action='store_true',
+                        help='init decoder tgt from topk encoder tokens (CQS-style)')
+
+
+
+
+
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
