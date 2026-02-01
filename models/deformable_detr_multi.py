@@ -31,7 +31,10 @@ from .backbone import build_backbone
 from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
+# from .deformable_transformer_multi_yuanshi import build_deforamble_transformer
+
 from .deformable_transformer_multi import build_deforamble_transformer
+
 import copy
 
 
@@ -155,46 +158,107 @@ class DeformableDETR(nn.Module):
             raise TypeError(f"Unsupported samples type: {type(samples)}")
 
 
-        # ===== 新增：tri-modal baseline fusion (9ch -> 3ch) =====
+        # x = samples.tensors
+        # m = samples.mask
+        # if x.dim() == 4 and x.shape[1] == 9:
+        #     vis = x[:, 0:3]
+        #     ir  = x[:, 3:6]
+        #     sar = x[:, 6:9]
+        #     x = (vis + ir + sar) / 3.0          # -> [B*(K+1), 3, H, W]
+        #     samples = NestedTensor(x, m)
+        # features, pos = self.backbone(samples)
+
         x = samples.tensors
         m = samples.mask
+
         if x.dim() == 4 and x.shape[1] == 9:
             vis = x[:, 0:3]
             ir  = x[:, 3:6]
             sar = x[:, 6:9]
-            x = (vis + ir + sar) / 3.0          # -> [B*(K+1), 3, H, W]
-            samples = NestedTensor(x, m)
-        # ===== 新增结束 =====
 
-        features, pos = self.backbone(samples)
+            samples_vis = NestedTensor(vis, m)
+            samples_ir  = NestedTensor(ir,  m)
+            samples_sar = NestedTensor(sar, m)
+
+            features_vis, pos = self.backbone(samples_vis)   # pos 取 vis 的
+            features_ir,  _   = self.backbone(samples_ir)
+            features_sar, _   = self.backbone(samples_sar)
+        else:
+            # 兼容：如果以后你传入的就是 3ch
+            features_vis, pos = self.backbone(samples)
+            features_ir, _    = self.backbone(samples)
+            features_sar, _   = self.backbone(samples)
+
+
         # print('features[-1].tensors.shape', features[-1].tensors.shape)
 
-        srcs = []
+        # srcs = []
+        # masks = []
+        # for l, feat in enumerate(features):
+        #     src, mask = feat.decompose()
+        #     srcs.append(self.input_proj[l](src))
+        #     masks.append(mask)
+        #     assert mask is not None
+
+        srcs_vis, srcs_ir, srcs_sar = [], [], []
         masks = []
-        for l, feat in enumerate(features):
-            src, mask = feat.decompose()
-            srcs.append(self.input_proj[l](src))
+
+        for l in range(len(features_vis)):
+            src_v, mask = features_vis[l].decompose()
+            src_i, _    = features_ir[l].decompose()
+            src_s, _    = features_sar[l].decompose()
+
+            srcs_vis.append(self.input_proj[l](src_v))
+            srcs_ir.append(self.input_proj[l](src_i))
+            srcs_sar.append(self.input_proj[l](src_s))
+
             masks.append(mask)
             assert mask is not None
 
-        if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
+        # if self.num_feature_levels > len(srcs):
+        #     _len_srcs = len(srcs)
+        #     for l in range(_len_srcs, self.num_feature_levels):
+        #         if l == _len_srcs:
+        #             src = self.input_proj[l](features[-1].tensors)
+        #         else:
+        #             src = self.input_proj[l](srcs[-1])
+        #         m = samples.mask
+        #         mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+        #         pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+        #         srcs.append(src)
+        #         masks.append(mask)
+        #         pos.append(pos_l)
+
+        if self.num_feature_levels > len(srcs_vis):
+            _len_srcs = len(srcs_vis)
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
-                    src = self.input_proj[l](features[-1].tensors)
+                    src_v = self.input_proj[l](features_vis[-1].tensors)
+                    src_i = self.input_proj[l](features_ir[-1].tensors)
+                    src_s = self.input_proj[l](features_sar[-1].tensors)
                 else:
-                    src = self.input_proj[l](srcs[-1])
+                    src_v = self.input_proj[l](srcs_vis[-1])
+                    src_i = self.input_proj[l](srcs_ir[-1])
+                    src_s = self.input_proj[l](srcs_sar[-1])
+
                 m = samples.mask
-                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
-                srcs.append(src)
+                mask = F.interpolate(m[None].float(), size=src_v.shape[-2:]).to(torch.bool)[0]
+
+                # pos 只算一份（用 vis 的 src_v）
+                pos_l = self.backbone[1](NestedTensor(src_v, mask)).to(src_v.dtype)
+
+                srcs_vis.append(src_v)
+                srcs_ir.append(src_i)
+                srcs_sar.append(src_s)
                 masks.append(mask)
                 pos.append(pos_l)
+
 
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs, masks, pos, query_embeds, self.class_embed[-1])
+        # hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs, masks, pos, query_embeds, self.class_embed[-1])
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs_vis, srcs_ir, srcs_sar, masks, pos, query_embeds, self.class_embed[-1])
 
         outputs_classes = []
         outputs_coords = []

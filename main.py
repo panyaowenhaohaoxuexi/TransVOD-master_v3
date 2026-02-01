@@ -552,6 +552,13 @@ def main(args):
     model.to(device)
 
     model_without_ddp = model
+
+    print("[where-am-i] model class:", model_without_ddp.__class__)
+    print("[where-am-i] transformer class:", model_without_ddp.transformer.__class__)
+    print("[where-am-i] transformer module:", model_without_ddp.transformer.__class__.__module__)
+
+
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
@@ -630,6 +637,23 @@ def main(args):
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+
+
+    # ===== optimizer check =====
+    opt_params = []
+    for g in optimizer.param_groups:
+        opt_params += list(g["params"])
+
+    opt_params_set = set([id(p) for p in opt_params])
+    trainable_params = [p for p in model_without_ddp.parameters() if p.requires_grad]
+    trainable_set = set([id(p) for p in trainable_params])
+
+    print("[opt-check] optimizer params:", len(opt_params))
+    print("[opt-check] trainable params:", len(trainable_params))
+    print("[opt-check] optimizer==trainable:", opt_params_set == trainable_set)
+
+
+
 
     print(args.lr_drop_epochs)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs)

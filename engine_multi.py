@@ -59,11 +59,31 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         optimizer.zero_grad()
         losses.backward()
+
+
+
+
+
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
         optimizer.step()
+
+
+
+
+
+        # ===== grad check: frozen params should NOT have grad =====
+        bad = []
+        for n, p in model.named_parameters():
+            if (not p.requires_grad) and (p.grad is not None):
+                bad.append(n)
+                if len(bad) >= 10:
+                    break
+        if len(bad) > 0:
+            print("[grad-check] frozen params have grad:", bad)
+
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
