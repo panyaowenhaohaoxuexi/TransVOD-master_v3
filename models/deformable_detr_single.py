@@ -159,7 +159,7 @@ class DeformableDETR(nn.Module):
     def forward(self, samples: NestedTensor):
         """
         支持两种输入：
-        - 单模态： [B,3,H,W]（保持原行为）
+        - 单模态： [B,3,H,W]
         - 三模态： [B,9,H,W]（VIS/IR/SAR 按通道拼接）
         """
         if not isinstance(samples, NestedTensor):
@@ -167,100 +167,85 @@ class DeformableDETR(nn.Module):
 
         c = samples.tensors.size(1)
 
-        # ---------- 1) 单模态：保持原逻辑 ----------
+        # ---------------------------------------------------------
+        # 1) 构建 transformer 输入：srcs / masks / pos
+        # ---------------------------------------------------------
         if c == 3:
             srcs, masks, pos = self._backbone_to_transformer_inputs(samples)
 
-        # ---------- 2) 三模态：切分 -> 各自走同一个 backbone（共享权重） ----------
-## 原始
-        # elif c == 9:
-        #     vis_s, ir_s, sar_s = self._split_trimodal_single(samples)
-
-        #     srcs_vis, masks_vis, pos_vis = self._backbone_to_transformer_inputs(vis_s)
-        #     srcs_ir,  _m2,      _p2     = self._backbone_to_transformer_inputs(ir_s)
-        #     srcs_sar, _m3,      _p3     = self._backbone_to_transformer_inputs(sar_s)
-
-        #     # 先用“临时融合”让现有 transformer 能跑通（后续你会替换为真正的三模态/时序模块）
-        #     srcs = []
-        #     masks = masks_vis
-        #     pos = pos_vis
-
-
+            # 如果误开了 trimodal transformer，用单模态特征复制三份以兼容接口
+            if getattr(self.transformer, "is_trimodal", False):
+                srcs = (srcs, srcs, srcs)
 
         elif c == 9:
             vis_s, ir_s, sar_s = self._split_trimodal_single(samples)
 
-            srcs_vis, masks_vis, pos_vis = self._backbone_to_transformer_inputs(vis_s)
-            srcs_ir,  _,       _       = self._backbone_to_transformer_inputs(ir_s)
-            srcs_sar, _,       _       = self._backbone_to_transformer_inputs(sar_s)
+            srcs_vis, masks, pos = self._backbone_to_transformer_inputs(vis_s)
+            srcs_ir,  _,     _   = self._backbone_to_transformer_inputs(ir_s)
+            srcs_sar, _,     _   = self._backbone_to_transformer_inputs(sar_s)
 
-            if getattr(self.transformer, 'is_trimodal', False):
-                # trimodal transformer expects 3 streams
+            if getattr(self.transformer, "is_trimodal", False):
+                # 三模态：不做 feature map 融合
                 srcs = (srcs_vis, srcs_ir, srcs_sar)
-                masks = masks_vis
-                pos = pos_vis
             else:
-                # fallback baseline: mean fusion
+                # baseline：均值融合（仅用于对照）
                 srcs = [(srcs_vis[l] + srcs_ir[l] + srcs_sar[l]) / 3.0 for l in range(len(srcs_vis))]
-                masks = masks_vis
-                pos = pos_vis
-
-
-            for l in range(len(srcs_vis)):
-                srcs.append((srcs_vis[l] + srcs_ir[l] + srcs_sar[l]) / 3.0)
-
-            # 如果你想后面接 TDTE/三模态 decoder，可在这里把三模态特征先保留（不影响现有训练）
-            # self._modal_cache = {"vis": (srcs_vis, masks_vis, pos_vis),
-            #                      "ir":  (srcs_ir,  masks_vis, pos_vis),
-            #                      "sar": (srcs_sar, masks_vis, pos_vis)}
 
         else:
             raise ValueError(f"Unsupported input channels: C={c}, expect 3 or 9")
 
-        # ---------- transformer ----------
+        # ---------------------------------------------------------
+        # 2) transformer（只调用一次）
+        # ---------------------------------------------------------
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
 
-        #  # 原始
-        # hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-        #     self.transformer(srcs, masks, pos, query_embeds)
-        
-        if isinstance(srcs, tuple):  # (vis, ir, sar)
+        if getattr(self.transformer, "is_trimodal", False):
+            # two-stage 下 query_embeds 不需要（传 None）；若你将来支持 one-stage，可传 query_embeds
             hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-                self.transformer(srcs[0], srcs[1], srcs[2], masks, pos, query_embeds)
+                self.transformer(srcs[0], srcs[1], srcs[2], masks, pos, None)
         else:
             hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
                 self.transformer(srcs, masks, pos, query_embeds)
 
-
+        # ---------------------------------------------------------
+        # 3) heads
+        # ---------------------------------------------------------
         outputs_classes = []
         outputs_coords = []
         for lvl in range(hs.shape[0]):
             reference = init_reference if lvl == 0 else inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
+
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
+
             if reference.shape[-1] == 4:
-                tmp += reference
+                tmp = tmp + reference
             else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
+                # reference: [B,Q,2]
+                tmp[..., :2] = tmp[..., :2] + reference
+
             outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
 
-        outputs_class = torch.stack(outputs_classes)
-        outputs_coord = torch.stack(outputs_coords)
+        outputs_class = torch.stack(outputs_classes)  # [L,B,Q,C]
+        outputs_coord = torch.stack(outputs_coords)   # [L,B,Q,4]
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
 
-        if self.two_stage:
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
-            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+        if self.two_stage and (enc_outputs_class is not None) and (enc_outputs_coord_unact is not None):
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord_unact.sigmoid(),
+            }
+
         return out
+
     
 
     # # 原始
