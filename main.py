@@ -508,13 +508,25 @@ def main(args):
     # ===== 修改点 2：统一 single/multi 判定（vid_single_3m 也算 single） =====
     is_single = args.dataset_file in ["vid_single", "vid_single_3m"]
 
+    # # choose engine/utils
+    # if is_single:
+    #     from engine_single import evaluate, train_one_epoch
+    #     import util.misc as utils
+    # else:
+    #     from engine_multi import evaluate, train_one_epoch
+    #     import util.misc_multi as utils
+
     # choose engine/utils
     if is_single:
         from engine_single import evaluate, train_one_epoch
         import util.misc as utils
     else:
         from engine_multi import evaluate, train_one_epoch
-        import util.misc_multi as utils
+        if args.dataset_file == "vid_multi_3m":
+            import util.misc_multi_3m as utils   # 关键：三模态多帧 split(9)
+        else:
+            import util.misc_multi as utils      # 原来的单模态 multi
+
 
     print(args.dataset_file)
     device = torch.device(args.device)
@@ -650,7 +662,15 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
 
         if args.eval:
-            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            # missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+            
+            state_dict = checkpoint['model']
+            # 删掉类别头，避免 31->3 的 shape mismatch
+            state_dict = {k: v for k, v in state_dict.items() if not k.startswith('class_embed')}
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
+
+
+
         else:
             tmp_dict = model_without_ddp.state_dict().copy()
             if args.coco_pretrain:  # singleBaseline: load everything except class_embed
@@ -667,7 +687,24 @@ def main(args):
                         param.requires_grad = True
                     else:
                         param.requires_grad = False
-            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)
+
+
+            trainable = [n for n, p in model_without_ddp.named_parameters() if p.requires_grad]
+            frozen = [n for n, p in model_without_ddp.named_parameters() if not p.requires_grad]
+            print("[freeze-check] trainable:", len(trainable), "frozen:", len(frozen))
+            print("[freeze-check] first trainable:", trainable[:20])
+
+            # ===== 3) 过滤 ckpt（推荐：class_embed + shape）=====
+            model_sd = model_without_ddp.state_dict()
+            tmp_dict = {k: v for k, v in tmp_dict.items() if not k.startswith("class_embed")}
+            tmp_dict = {k: v for k, v in tmp_dict.items() if (k in model_sd and model_sd[k].shape == v.shape)}
+
+
+            # # missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)
+            # tmp_dict = {k: v for k, v in tmp_dict.items() if not k.startswith("class_embed")}
+
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)   
+
 
         unexpected_keys = [
             k for k in unexpected_keys

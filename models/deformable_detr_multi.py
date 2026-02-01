@@ -16,9 +16,16 @@ from torch import nn
 import math
 
 from util import box_ops
-from util.misc_multi import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, interpolate,
-                       is_dist_avail_and_initialized, inverse_sigmoid)
+# from util.misc_multi import (NestedTensor, nested_tensor_from_tensor_list,
+#                        accuracy, get_world_size, interpolate,
+#                        is_dist_avail_and_initialized, inverse_sigmoid)
+
+from util.misc import NestedTensor
+from util.misc_multi import (accuracy, get_world_size, interpolate,
+                             is_dist_avail_and_initialized, inverse_sigmoid)
+from util.misc_multi_3m import nested_tensor_from_tensor_list
+
+
 
 from .backbone import build_backbone
 from .matcher import build_matcher
@@ -138,8 +145,27 @@ class DeformableDETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
-        if not isinstance(samples, NestedTensor):
+        # if not isinstance(samples, NestedTensor):
+        #     samples = nested_tensor_from_tensor_list(samples)
+
+        if isinstance(samples, (list, tuple)):
+        # 只有 list/tuple 才需要转 NestedTensor
             samples = nested_tensor_from_tensor_list(samples)
+        elif not isinstance(samples, NestedTensor):
+            raise TypeError(f"Unsupported samples type: {type(samples)}")
+
+
+        # ===== 新增：tri-modal baseline fusion (9ch -> 3ch) =====
+        x = samples.tensors
+        m = samples.mask
+        if x.dim() == 4 and x.shape[1] == 9:
+            vis = x[:, 0:3]
+            ir  = x[:, 3:6]
+            sar = x[:, 6:9]
+            x = (vis + ir + sar) / 3.0          # -> [B*(K+1), 3, H, W]
+            samples = NestedTensor(x, m)
+        # ===== 新增结束 =====
+
         features, pos = self.backbone(samples)
         # print('features[-1].tensors.shape', features[-1].tensors.shape)
 
@@ -448,7 +474,10 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 31
+    # 原始
+    # num_classes = 31
+    num_classes = args.num_classes
+
     device = torch.device(args.device)
 
     backbone = build_backbone(args)

@@ -11,6 +11,10 @@
 from pathlib import Path
 import os
 from io import BytesIO
+
+from PIL import Image
+
+
 import random
 
 import torch
@@ -37,7 +41,7 @@ class CocoDetection3M(TvCocoDetection):
                  ann_file, transforms, return_masks,
                  interval1, interval2, num_ref_frames=3,
                  is_train=True, filter_key_img=True,
-                 cache_mode=False, local_rank=0, local_size=1):
+                 cache_mode=False, local_rank=0, local_size=1, num_classes=None):
 
         super(CocoDetection3M, self).__init__(
             img_folder_vis, ann_file,
@@ -64,6 +68,18 @@ class CocoDetection3M(TvCocoDetection):
         self.cache_ir = {} if cache_mode else None
         self.cache_sar = {} if cache_mode else None
 
+        # ===== category_id -> contiguous [0..num_classes-1] =====
+        self.num_classes = num_classes
+        cat_ids = sorted(self.coco.getCatIds())
+        # 调试
+        # print("[DEBUG] num_classes passed in:", self.num_classes, "num cats in json:", len(cat_ids))
+        self.catid2contiguous = {cat_id: i for i, cat_id in enumerate(cat_ids)}
+
+        if self.num_classes is not None:
+            assert len(cat_ids) == self.num_classes, \
+                f"num_classes={self.num_classes} but dataset has {len(cat_ids)} categories: {cat_ids}"
+
+
     def _open_from_root(self, root_dir: str, rel_path: str, cache_dict=None):
         full_path = os.path.join(root_dir, rel_path)
         if self.cache_mode:
@@ -71,7 +87,7 @@ class CocoDetection3M(TvCocoDetection):
                 with open(full_path, "rb") as f:
                     cache_dict[rel_path] = f.read()
             return Image.open(BytesIO(cache_dict[rel_path])).convert("RGB")
-        from PIL import Image
+        # from PIL import Image
         return Image.open(full_path).convert("RGB")
 
     def _get_triplet(self, file_name: str):
@@ -92,6 +108,8 @@ class CocoDetection3M(TvCocoDetection):
         coco = self.coco
 
         img_id = self.ids[idx]
+
+
         ann_ids = coco.getAnnIds(imgIds=img_id)
         anns = coco.loadAnns(ann_ids)
 
@@ -102,8 +120,34 @@ class CocoDetection3M(TvCocoDetection):
         # current frame triplet
         img_vis, img_ir, img_sar = self._get_triplet(path)
 
+
+        # ===== 新增：在 prepare 之前把 category_id 映射为连续标签 =====
+        # 依赖 self.catid2contiguous（你需要在 __init__ 里建立它）
+        valid_anns = []
+        for a in anns:
+            cid = a.get("category_id", None)
+            if cid in self.catid2contiguous:              # 保留已知类别
+                a["category_id"] = self.catid2contiguous[cid]  # 原地改成 0..C-1
+                valid_anns.append(a)
+        anns = valid_anns
+        # ===== 新增结束 =====
+
+
         target = {"image_id": img_id, "annotations": anns}
         img_vis, target = self.prepare(img_vis, target)
+
+        # ===== 可选：断言确认映射生效 =====
+        if self.num_classes is not None and target["labels"].numel() > 0:
+            assert target["labels"].min().item() >= 0
+            assert target["labels"].max().item() < self.num_classes, \
+                f"label out of range: max={target['labels'].max().item()}, num_classes={self.num_classes}"
+        # ===== 断言结束 =====
+
+
+
+
+
+
 
         # IMPORTANT: append in fixed order
         imgs.extend([img_vis, img_ir, img_sar])
@@ -316,6 +360,7 @@ def build(image_set, args):
             filter_key_img=True,
             local_rank=get_local_rank(),
             local_size=get_local_size(),
+            num_classes=args.num_classes,   # <-- 补这一行
         )
         datasets.append(dataset)
 
