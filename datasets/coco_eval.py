@@ -41,6 +41,12 @@ class CocoEvaluator(object):
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
 
+        # --- add: label(0..C-1) -> coco category_id mapping ---
+        # coco_gt categories id may start from 1 (e.g. 1,2,3) rather than 0
+        self.cat_ids = sorted(self.coco_gt.getCatIds())  # e.g. [1,2,3]
+        self.label2cat = {i: cid for i, cid in enumerate(self.cat_ids)}
+
+
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
         self.img_ids.extend(img_ids)
@@ -99,7 +105,9 @@ class CocoEvaluator(object):
                 [
                     {
                         "image_id": original_id,
-                        "category_id": labels[k],
+                        ## 原始
+                        # "category_id": labels[k],
+                        "category_id": self.label2cat[int(labels[k])],
                         "bbox": box,
                         "score": scores[k],
                     }
@@ -134,7 +142,9 @@ class CocoEvaluator(object):
                 [
                     {
                         "image_id": original_id,
-                        "category_id": labels[k],
+                        # 原始
+                        # "category_id": labels[k],
+                        "category_id": self.label2cat[int(labels[k])],
                         "segmentation": rle,
                         "score": scores[k],
                     }
@@ -160,7 +170,9 @@ class CocoEvaluator(object):
                 [
                     {
                         "image_id": original_id,
-                        "category_id": labels[k],
+                        # 原始
+                        # "category_id": labels[k],
+                        "category_id": self.label2cat[int(labels[k])],
                         'keypoints': keypoint,
                         "score": scores[k],
                     }
