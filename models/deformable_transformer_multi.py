@@ -274,26 +274,34 @@ class DeformableTransformer(nn.Module):
 
         # 2) TDAM（temporal_encoder_layer）相关只在 TDAM=True 时计算，避免 TDAM=False 仍执行 ref_memory 等逻辑
         if self.TDAM:
+            # print once
+            if self.training and (not hasattr(self, "_dbg_tdam_once")):
+                self._dbg_tdam_once = True
+                print("[TDAM] enabled, num_ref_frames =", self.num_ref_frames,
+                    "num_feature_levels =", int(spatial_shapes.shape[0]),
+                    "spatial_shapes =", spatial_shapes.tolist())
+
+            # capture-before flag (local)
+            do_delta_check = self.training and (not hasattr(self, "_dbg_tdam_delta_once"))
+            if do_delta_check:
+                cur_mem_vis_before = cur_memory_vis.detach()
+
             # 把 reference frames 当作 “levels”
             ref_spatial_shapes = spatial_shapes.expand(self.num_ref_frames, 2).contiguous()
             frame_start_index = torch.cat(
                 (ref_spatial_shapes.new_zeros((1,)), ref_spatial_shapes.prod(1).cumsum(0)[:-1])
             ).contiguous()
 
-            # pos: 当前帧 / 参考帧
             cur_pos_embed = lvl_pos_embed_flatten[0:1]
             ref_pos_embed_list = torch.chunk(lvl_pos_embed_flatten[1:], self.num_ref_frames, dim=0)
             ref_pos_embed = torch.cat(ref_pos_embed_list, 1)
 
-            # valid_ratios 用新的变量，不覆盖原来的 valid_ratios（原来的还要给 temporal_decoder 用）
             valid_ratios_ref = valid_ratios[0:1].expand(1, self.num_ref_frames, 2)
 
-            # 当前帧 grid reference_points（按当前 spatial_shapes 生成，再按各 ref frame ratio 广播）
             reference_points = self.get_reference_points(
                 spatial_shapes, valid_ratios_ref, device=cur_memory_vis.device
             )
 
-            # 三模态各自做同模态 TDAM（不跨模态）
             ref_memory_vis = torch.cat(memory_list_vis[1:], 1) + ref_pos_embed
             ref_memory_ir = torch.cat(memory_list_ir[1:], 1) + ref_pos_embed
             ref_memory_sar = torch.cat(memory_list_sar[1:], 1) + ref_pos_embed
@@ -311,7 +319,13 @@ class DeformableTransformer(nn.Module):
                 ref_memory_sar, ref_spatial_shapes, frame_start_index
             )
 
+            if do_delta_check:
+                self._dbg_tdam_delta_once = True
+                delta = (cur_memory_vis.detach() - cur_mem_vis_before).pow(2).mean().sqrt().item()
+                print("[TDAM-check] cur_memory_vis delta(L2mean) =", delta)
+
             cur_memory = (cur_memory_vis, cur_memory_ir, cur_memory_sar)
+
 
         # 3) temporal query enhancement (Top-K from ref_hs)
         last_hs = hs[-1]

@@ -22,7 +22,8 @@ def run_multi():
     args.dilation = True
     args.batch_size = 1
     args.num_ref_frames = 3
-    args.cqs_topk = 50   # 例如每帧筛到 100
+    args.cqs_topk = 100   # 例如每帧筛到 100
+    args.tdam = True
     args.lr_drop_epochs = [4, 6]
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
