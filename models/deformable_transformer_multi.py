@@ -308,6 +308,8 @@ class DeformableTransformer(nn.Module):
 
         # 2) TDAM（temporal_encoder_layer）相关只在 TDAM=True 时计算，避免 TDAM=False 仍执行 ref_memory 等逻辑
         if self.TDAM:
+            valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]  # [B, L, 2]
+
             # print once
             if self.training and (not hasattr(self, "_dbg_tdam_once")):
                 self._dbg_tdam_once = True
@@ -319,6 +321,9 @@ class DeformableTransformer(nn.Module):
             do_delta_check = self.training and (not hasattr(self, "_dbg_tdam_delta_once"))
             if do_delta_check:
                 cur_mem_vis_before = cur_memory_vis.detach()
+                cur_mem_ir_before  = cur_memory_ir.detach()
+                cur_mem_sar_before = cur_memory_sar.detach()
+
 
             # 把 reference frames 当作 “levels”
             ref_spatial_shapes = spatial_shapes.expand(self.num_ref_frames, 2).contiguous()
@@ -326,15 +331,20 @@ class DeformableTransformer(nn.Module):
                 (ref_spatial_shapes.new_zeros((1,)), ref_spatial_shapes.prod(1).cumsum(0)[:-1])
             ).contiguous()
 
-            cur_pos_embed = lvl_pos_embed_flatten[0:1]
-            ref_pos_embed_list = torch.chunk(lvl_pos_embed_flatten[1:], self.num_ref_frames, dim=0)
-            ref_pos_embed = torch.cat(ref_pos_embed_list, 1)
+            lvl_pos_list = torch.chunk(lvl_pos_embed_flatten, self.num_ref_frames + 1, dim=0)
+            cur_pos_embed = lvl_pos_list[0]                 # [B, sum_hw, C]
+            ref_pos_embed = torch.cat(lvl_pos_list[1:], 1)  # [B, K*sum_hw, C]
 
-            valid_ratios_ref = valid_ratios[0:1].expand(1, self.num_ref_frames, 2)
+
+            valid_ratios_ref = valid_ratios_cur.expand(valid_ratios_cur.shape[0], self.num_ref_frames, 2)
+
 
             reference_points = self.get_reference_points(
                 spatial_shapes, valid_ratios_ref, device=cur_memory_vis.device
             )
+            assert reference_points.shape[1] == cur_memory_vis.shape[1], (reference_points.shape, cur_memory_vis.shape)
+            assert reference_points.shape[2] == self.num_ref_frames, reference_points.shape
+
 
             ref_memory_vis = torch.cat(memory_list_vis[1:], 1) + ref_pos_embed
             ref_memory_ir = torch.cat(memory_list_ir[1:], 1) + ref_pos_embed
@@ -355,8 +365,11 @@ class DeformableTransformer(nn.Module):
 
             if do_delta_check:
                 self._dbg_tdam_delta_once = True
-                delta = (cur_memory_vis.detach() - cur_mem_vis_before).pow(2).mean().sqrt().item()
-                print("[TDAM-check] cur_memory_vis delta(L2mean) =", delta)
+                d_vis = (cur_memory_vis.detach() - cur_mem_vis_before).pow(2).mean().sqrt().item()
+                d_ir  = (cur_memory_ir.detach()  - cur_mem_ir_before ).pow(2).mean().sqrt().item()
+                d_sar = (cur_memory_sar.detach() - cur_mem_sar_before).pow(2).mean().sqrt().item()
+                print("[TDAM-check] delta vis/ir/sar =", d_vis, d_ir, d_sar)
+
 
             cur_memory = (cur_memory_vis, cur_memory_ir, cur_memory_sar)
 
@@ -425,7 +438,7 @@ class DeformableTransformer(nn.Module):
             uniq = torch.unique(idx1.reshape(-1)).numel()
             print("[TopK-unique] k1 =", k1, "unique =", uniq)
         cur_hs = self.temporal_query_layer1(cur_hs, ref_hs_input1)
-        
+
         k2, idx2, ref_hs_input2 = _topk_ref_by_ratio(0.5)
         cur_hs = self.temporal_query_layer2(cur_hs, ref_hs_input2)
 
@@ -448,11 +461,20 @@ class DeformableTransformer(nn.Module):
 
         # 4) temporal decoder: 输入三模态当前帧 memory tuple
         # 注意：这里必须用 “原始 valid_ratios[0:1]” (shape [1, n_levels, 2])，不要用 TDAM 的 valid_ratios_ref
+        valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]
         final_hs, final_references_out = self.temporal_decoder(
             cur_hs, cur_reference_out, cur_memory,
-            spatial_shapes[0:1], level_start_index[0:1], valid_ratios[0:1],
+            spatial_shapes, level_start_index, valid_ratios_cur,
             None, None
         )
+        if self.training and (not hasattr(self, "_dbg_td_once")):
+            self._dbg_td_once = True
+            # final_hs: [n_layers, B, Q, C] or [1,B,Q,C] depending implementation
+            # use last layer output
+            td_out = final_hs[-1] if final_hs.dim() == 4 else final_hs
+            delta_q = (td_out.detach() - cur_hs.detach()).pow(2).mean().sqrt().item()
+            print("[TD-check] delta(final_hs vs cur_hs) =", delta_q)
+
 
         # --- select current-frame encoder outputs for two-stage ---
         enc_outputs_class_cur = None
