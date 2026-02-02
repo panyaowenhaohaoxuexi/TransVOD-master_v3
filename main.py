@@ -405,8 +405,11 @@ def get_args_parser():
     parser.add_argument('--trimodal_decoder', default=False, action='store_true',
                         help='use tri-modal query-fusion decoder for (VIS/IR/SAR)')
     parser.add_argument('--trimodal_fusion', default='avg', type=str,
-                        choices=['avg', 'gated', 'concat'],
-                        help='fusion type on query side')
+                        choices=['avg', 'gated', 'concat', 'msd'],
+                        help='query-side fusion type; set to msd to use DAMSDet-style multispectral deformable decoder (treat modalities as extra feature levels)')
+    parser.add_argument('--trimodal_fusion_multi', default='gated', type=str,
+                        choices=['avg', 'gated', 'concat', 'msd'],
+                        help='fusion type for multi-frame (Stage-2) transformer decoder; default keeps historical behavior (gated). Set to msd to use DAMSDet-style multispectral deformable decoder.')
     parser.add_argument('--init_query_from_features', default=False, action='store_true',
                         help='init decoder tgt from topk encoder tokens (CQS-style)')
 

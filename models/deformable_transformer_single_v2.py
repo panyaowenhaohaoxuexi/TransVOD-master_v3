@@ -423,11 +423,8 @@ class TriModalDeformableTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.fusion = fusion
 
-        # cross-attn
-        # - fusion in {'avg','gated','concat'}: shared cross-attn used 3 times (one per modality)
-        # - fusion == 'msd': DAMSDet-style multispectral deformable decoder (modalities as extra feature levels)
-        attn_levels = n_levels * 3 if fusion == 'msd' else n_levels
-        self.cross_attn = MSDeformAttn(d_model, attn_levels, n_heads, n_points)
+        # shared cross-attn (weights shared across modalities)
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -436,7 +433,7 @@ class TriModalDeformableTransformerDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
-        # fusion params (only used when fusion != 'msd')
+        # fusion params
         if fusion == 'gated':
             self.gate = nn.Linear(d_model, 3)
         elif fusion == 'concat':
@@ -470,27 +467,6 @@ class TriModalDeformableTransformerDecoderLayer(nn.Module):
             return self.fuse(torch.cat([a, b, c], dim=-1))
         raise ValueError(f"Unknown fusion: {self.fusion}")
 
-    @staticmethod
-    def _pack_msd_triplet(vis_mem, ir_mem, sar_mem,
-                          src_spatial_shapes, src_level_start_index,
-                          src_padding_masks=None):
-        """Pack (VIS, IR, SAR) into a single multispectral sequence.
-
-        Treat each modality's feature pyramid as extra feature levels (DAMSDet-style).
-        """
-        src_cat = torch.cat([vis_mem, ir_mem, sar_mem], dim=1)
-        spatial_shapes_msd = src_spatial_shapes.repeat(3, 1)
-        base_total = src_spatial_shapes.prod(1).sum()
-        lsi_msd = torch.cat([src_level_start_index + i * base_total for i in range(3)], dim=0)
-
-        if src_padding_masks is None:
-            mask_msd = None
-        else:
-            vis_mask, ir_mask, sar_mask = src_padding_masks
-            # in this repo VIS/IR/SAR masks are typically identical; we still concatenate to match seq length.
-            mask_msd = torch.cat([vis_mask, ir_mask, sar_mask], dim=1)
-        return src_cat, spatial_shapes_msd, lsi_msd, mask_msd
-
     def forward(self, tgt, query_pos, reference_points,
                 srcs, src_spatial_shapes, level_start_index, src_padding_masks=None):
         # srcs: (vis_mem, ir_mem, sar_mem)
@@ -507,23 +483,12 @@ class TriModalDeformableTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
+        # tri-modal cross attention (query-side fusion)
         q_in = self.with_pos_embed(tgt, query_pos)
-        if self.fusion == 'msd':
-            # DAMSDet-style multispectral deformable attention: one cross-attn over packed modalities.
-            src_cat, shapes_msd, lsi_msd, mask_msd = self._pack_msd_triplet(
-                vis_mem, ir_mem, sar_mem,
-                src_spatial_shapes, level_start_index,
-                src_padding_masks=(vis_mask, ir_mask, sar_mask) if src_padding_masks is not None else None
-            )
-            # reference_points: [B,Q,L,2/4] -> [B,Q,3L,2/4]
-            ref_msd = reference_points.repeat(1, 1, 3, 1)
-            fused = self.cross_attn(q_in, ref_msd, src_cat, shapes_msd, lsi_msd, mask_msd)
-        else:
-            # tri-modal cross attention (query-side fusion)
-            out_vis = self.cross_attn(q_in, reference_points, vis_mem, src_spatial_shapes, level_start_index, vis_mask)
-            out_ir  = self.cross_attn(q_in, reference_points, ir_mem,  src_spatial_shapes, level_start_index, ir_mask)
-            out_sar = self.cross_attn(q_in, reference_points, sar_mem, src_spatial_shapes, level_start_index, sar_mask)
-            fused = self._fuse(tgt, out_vis, out_ir, out_sar)
+        out_vis = self.cross_attn(q_in, reference_points, vis_mem, src_spatial_shapes, level_start_index, vis_mask)
+        out_ir  = self.cross_attn(q_in, reference_points, ir_mem,  src_spatial_shapes, level_start_index, ir_mask)
+        out_sar = self.cross_attn(q_in, reference_points, sar_mem, src_spatial_shapes, level_start_index, sar_mask)
+        fused = self._fuse(tgt, out_vis, out_ir, out_sar)
 
         tgt = tgt + self.dropout1(fused)
         tgt = self.norm1(tgt)

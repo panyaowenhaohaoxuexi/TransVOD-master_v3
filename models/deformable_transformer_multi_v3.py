@@ -44,25 +44,15 @@ class DeformableTransformer(nn.Module):
 
         self.init_query_from_features = bool(getattr(args, "init_query_from_features", False))
 
-        # Decoder fusion mode:
-        # - 'gated'/'avg'/'concat': do per-modality cross-attn then fuse on query side
-        # - 'msd': DAMSDet-style multispectral decoder: treat modalities as extra feature levels,
-        #          run ONE MSDeformAttn so sampling offsets are predicted per (modality, level).
-        # Use a separate arg name for Stage-2 to avoid changing historical default behavior.
-        self.trimodal_fusion = 'gated' if args is None else str(getattr(args, 'trimodal_fusion_multi', 'gated'))
-        self.use_msd_decoder = (self.trimodal_fusion == 'msd')
-
 
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, enc_n_points)
         self.encoder = DeformableTransformerEncoder(encoder_layer, num_encoder_layers)
 
-        dec_levels = num_feature_levels * 3 if self.use_msd_decoder else num_feature_levels
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          dec_levels, nhead, dec_n_points,
-                                                          fusion=self.trimodal_fusion)
+                                                          num_feature_levels, nhead, dec_n_points)
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
@@ -153,45 +143,6 @@ class DeformableTransformer(nn.Module):
         valid_ratio_w = valid_W.float() / W
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
-
-    @staticmethod
-    def _pack_msd_triplet(
-        mem_vis: torch.Tensor,
-        mem_ir: torch.Tensor,
-        mem_sar: torch.Tensor,
-        spatial_shapes: torch.Tensor,
-        level_start_index: torch.Tensor,
-        valid_ratios: torch.Tensor,
-        padding_mask: torch.Tensor = None,
-    ):
-        """Pack (VIS, IR, SAR) into a single multispectral sequence.
-
-        This follows DAMSDet-style multispectral deformable attention:
-        treat each modality's feature pyramid as extra feature levels.
-        """
-        # seq concat: [B, S, C] -> [B, 3S, C]
-        src_cat = torch.cat([mem_vis, mem_ir, mem_sar], dim=1)
-
-        # repeat spatial shapes: [L,2] -> [3L,2]
-        spatial_shapes_msd = spatial_shapes.repeat(3, 1)
-
-        # level_start_index: [L] -> [3L], with modality offsets
-        # base_total = sum_l (H_l * W_l)
-        base_total = spatial_shapes.prod(1).sum()
-        level_start_index_msd = torch.cat(
-            [level_start_index + i * base_total for i in range(3)], dim=0
-        )
-
-        # valid_ratios: [B,L,2] -> [B,3L,2]
-        valid_ratios_msd = valid_ratios.repeat(1, 3, 1)
-
-        # padding mask: [B,S] -> [B,3S]
-        if padding_mask is None:
-            padding_mask_msd = None
-        else:
-            padding_mask_msd = torch.cat([padding_mask, padding_mask, padding_mask], dim=1)
-
-        return src_cat, spatial_shapes_msd, level_start_index_msd, valid_ratios_msd, padding_mask_msd
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -315,27 +266,13 @@ class DeformableTransformer(nn.Module):
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
 
-        # decoder
-        # - fusion in {'avg','gated','concat'}: per-modality deformable cross-attn then fuse on query-side
-        # - fusion == 'msd': DAMSDet-style multispectral deformable decoder (modalities as extra feature levels)
-        if self.use_msd_decoder:
-            src_cat, shapes_cat, lsi_cat, ratios_cat, mask_cat = self._pack_msd_triplet(
-                memory_vis, memory_ir, memory_sar,
-                spatial_shapes, level_start_index, valid_ratios,
-                padding_mask=mask_flatten
-            )
-            hs, inter_references = self.decoder(
-                tgt, reference_points, src_cat,
-                shapes_cat, lsi_cat, ratios_cat,
-                query_embed, mask_cat
-            )
-        else:
-            memories = (memory_vis, memory_ir, memory_sar)
-            hs, inter_references = self.decoder(
-                tgt, reference_points, memories,
-                spatial_shapes, level_start_index, valid_ratios,
-                query_embed, mask_flatten
-            )
+        # decoder (tri-modal memory)
+        memories = (memory_vis, memory_ir, memory_sar)
+        hs, inter_references = self.decoder(
+            tgt, reference_points, memories,
+            spatial_shapes, level_start_index, valid_ratios,
+            query_embed, mask_flatten
+        )
 
         inter_references_out = inter_references
         # if self.two_stage:
@@ -519,23 +456,11 @@ class DeformableTransformer(nn.Module):
         # 4) temporal decoder: 输入三模态当前帧 memory tuple
         # 注意：这里必须用 “原始 valid_ratios[0:1]” (shape [1, n_levels, 2])，不要用 TDAM 的 valid_ratios_ref
         valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]
-        if self.use_msd_decoder:
-            cur_src_cat, cur_shapes_cat, cur_lsi_cat, cur_ratios_cat, _ = self._pack_msd_triplet(
-                cur_memory_vis, cur_memory_ir, cur_memory_sar,
-                spatial_shapes, level_start_index, valid_ratios_cur,
-                padding_mask=None
-            )
-            final_hs, final_references_out = self.temporal_decoder(
-                cur_hs, cur_reference_out, cur_src_cat,
-                cur_shapes_cat, cur_lsi_cat, cur_ratios_cat,
-                None, None
-            )
-        else:
-            final_hs, final_references_out = self.temporal_decoder(
-                cur_hs, cur_reference_out, cur_memory,
-                spatial_shapes, level_start_index, valid_ratios_cur,
-                None, None
-            )
+        final_hs, final_references_out = self.temporal_decoder(
+            cur_hs, cur_reference_out, cur_memory,
+            spatial_shapes, level_start_index, valid_ratios_cur,
+            None, None
+        )
         if self.training and (not hasattr(self, "_dbg_td_once")):
             self._dbg_td_once = True
             # final_hs: [n_layers, B, Q, C] or [1,B,Q,C] depending implementation
@@ -738,21 +663,14 @@ class DeformableTransformerEncoder(nn.Module):
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4,
-                 fusion: str = 'gated'):
+                 n_levels=4, n_heads=8, n_points=4):
         super().__init__()
-
-        self.fusion = fusion
 
         self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
-        # query-side fusion params (only used when fusion != 'msd')
-        if fusion == 'gated':
-            self.modal_gate = nn.Linear(d_model, 3)
-        elif fusion == 'concat':
-            self.fuse = nn.Linear(d_model * 3, d_model)
+        self.modal_gate = nn.Linear(d_model, 3)
 
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -782,26 +700,18 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm2(tgt)
 
         if isinstance(src, (tuple, list)):
-            # fusion on query-side (one deformable cross-attn per modality)
             src_vis, src_ir, src_sar = src
 
-            q_in = self.with_pos_embed(tgt, query_pos)
-            out_vis = self.cross_attn(q_in, reference_points, src_vis, src_spatial_shapes, level_start_index, src_padding_mask)
-            out_ir  = self.cross_attn(q_in, reference_points, src_ir,  src_spatial_shapes, level_start_index, src_padding_mask)
-            out_sar = self.cross_attn(q_in, reference_points, src_sar, src_spatial_shapes, level_start_index, src_padding_mask)
+            out_vis = self.cross_attn(self.with_pos_embed(tgt, query_pos),
+                                      reference_points, src_vis, src_spatial_shapes, level_start_index, src_padding_mask)
+            out_ir = self.cross_attn(self.with_pos_embed(tgt, query_pos),
+                                     reference_points, src_ir, src_spatial_shapes, level_start_index, src_padding_mask)
+            out_sar = self.cross_attn(self.with_pos_embed(tgt, query_pos),
+                                      reference_points, src_sar, src_spatial_shapes, level_start_index, src_padding_mask)
 
-            if self.fusion == 'avg':
-                tgt2 = (out_vis + out_ir + out_sar) / 3.0
-            elif self.fusion == 'gated':
-                gate = torch.softmax(self.modal_gate(tgt), dim=-1)  # [B, Q, 3]
-                tgt2 = gate[..., 0:1] * out_vis + gate[..., 1:2] * out_ir + gate[..., 2:3] * out_sar
-            elif self.fusion == 'concat':
-                tgt2 = self.fuse(torch.cat([out_vis, out_ir, out_sar], dim=-1))
-            else:
-                raise ValueError(f"Unknown fusion mode for tuple src: {self.fusion}")
+            gate = torch.softmax(self.modal_gate(tgt), dim=-1)  # [B, Q, 3]
+            tgt2 = gate[..., 0:1] * out_vis + gate[..., 1:2] * out_ir + gate[..., 2:3] * out_sar
         else:
-            # DAMSDet-style multispectral deformable decoder (fusion=='msd')
-            # or single-modality path (src is already packed)
             tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
                                    reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask)
 
