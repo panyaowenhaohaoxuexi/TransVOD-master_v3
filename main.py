@@ -397,6 +397,10 @@ def get_args_parser():
     parser.add_argument('--with_box_refine', default=False, action='store_true')
     parser.add_argument('--two_stage', default=False, action='store_true')
 
+    parser.add_argument('--cqs_topk', default=0, type=int,
+                    help='per-frame Competitive Query Selection topk before TQE; 0 disables')
+
+
 ## 修改
     parser.add_argument('--trimodal_decoder', default=False, action='store_true',
                         help='use tri-modal query-fusion decoder for (VIS/IR/SAR)')
