@@ -413,10 +413,6 @@ def get_args_parser():
     parser.add_argument('--init_query_from_features', default=False, action='store_true',
                         help='init decoder tgt from topk encoder tokens (CQS-style)')
 
-
-
-
-
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")

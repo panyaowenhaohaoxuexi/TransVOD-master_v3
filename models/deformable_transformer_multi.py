@@ -53,6 +53,10 @@ class DeformableTransformer(nn.Module):
         self.use_msd_decoder = (self.trimodal_fusion == 'msd')
 
 
+
+        # Always use DAMSDet-style multispectral decoder for FINAL (temporal) decoding.
+        # Hard-coded (no CLI switch).
+        self.use_msd_temporal_decoder = True
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, enc_n_points)
@@ -76,7 +80,18 @@ class DeformableTransformer(nn.Module):
         self.temporal_query_layer1 = TemporalQueryEncoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
         self.temporal_query_layer2 = TemporalQueryEncoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
         self.temporal_query_layer3 = TemporalQueryEncoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
-        self.temporal_decoder = TemporalDeformableTransformerDecoder(decoder_layer, n_temporal_decoder_layers, False)
+
+
+
+        # Final temporal decoder: hard-code DAMSDet-style multispectral decoding (modalities as extra levels).
+        temporal_decoder_layer = DeformableTransformerDecoderLayer(
+            d_model, dim_feedforward, dropout, activation,
+            num_feature_levels * 3, nhead, dec_n_points,
+            fusion='msd'
+        )
+        self.temporal_decoder = TemporalDeformableTransformerDecoder(
+            temporal_decoder_layer, n_temporal_decoder_layers, False
+        )
 
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
@@ -519,7 +534,7 @@ class DeformableTransformer(nn.Module):
         # 4) temporal decoder: 输入三模态当前帧 memory tuple
         # 注意：这里必须用 “原始 valid_ratios[0:1]” (shape [1, n_levels, 2])，不要用 TDAM 的 valid_ratios_ref
         valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]
-        if self.use_msd_decoder:
+        if self.use_msd_temporal_decoder:
             cur_src_cat, cur_shapes_cat, cur_lsi_cat, cur_ratios_cat, _ = self._pack_msd_triplet(
                 cur_memory_vis, cur_memory_ir, cur_memory_sar,
                 spatial_shapes, level_start_index, valid_ratios_cur,
