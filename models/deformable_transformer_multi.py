@@ -49,10 +49,8 @@ class DeformableTransformer(nn.Module):
         # - 'msd': DAMSDet-style multispectral decoder: treat modalities as extra feature levels,
         #          run ONE MSDeformAttn so sampling offsets are predicted per (modality, level).
         # Use a separate arg name for Stage-2 to avoid changing historical default behavior.
-        self.trimodal_fusion = 'gated' if args is None else str(getattr(args, 'trimodal_fusion_multi', 'gated'))
-        self.use_msd_decoder = (self.trimodal_fusion == 'msd')
-
-
+        self.trimodal_fusion = 'msd'
+        self.use_msd_decoder = True
 
         # Always use DAMSDet-style multispectral decoder for FINAL (temporal) decoding.
         # Hard-coded (no CLI switch).
