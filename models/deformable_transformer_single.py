@@ -760,7 +760,8 @@ def build_deforamble_transformer(args):
             enc_n_points=args.enc_n_points,
             two_stage=True,
             two_stage_num_proposals=args.num_queries,
-            fusion=getattr(args, 'trimodal_fusion', 'avg'),
+            # fusion=getattr(args, 'trimodal_fusion', 'avg'),
+            fusion='msd',
             init_query_from_features=getattr(args, 'init_query_from_features', False),
         )
 
