@@ -403,77 +403,41 @@ class DeformableTransformer(nn.Module):
         ref_hs = torch.cat(last_hs_list[1:], 1)
         cur_reference_out = last_reference_out_list[0]
 
-        ref_hs_logits = class_embed(ref_hs)
+        ref_hs_logits = class_embed(ref_hs)     # [B, ref_len, num_cls]
         prob = ref_hs_logits.sigmoid()
-
-
-        # ===== DEBUG: verify topk clamp / index range (remove after verification) =====
-        flat_len = prob.view(ref_hs_logits.shape[0], -1).shape[1]  # = ref_hs_len * num_classes
         ref_len = ref_hs.shape[1]
-        num_cls = ref_hs_logits.shape[2]
 
-        # optional one-time print
-        if self.training and (not hasattr(self, "_dbg_tqe_once")):
-            self._dbg_tqe_once = True
-            print("[TQE] ref_len =", ref_len, "num_cls =", num_cls, "flat_len =", flat_len)
-        # ===== END DEBUG =====
+        # 1) 用 “每个 query 的最大类别置信度” 作为 query-level score，避免同一 query 多类别重复入选
+        scores = prob.max(-1)[0]               # [B, ref_len]
 
+        # 2) 按比例采样（在 Top-K 集合内部）
+        #    比例你可先固定为 0.8 / 0.5 / 0.3（对应旧的 80/50/30 思路）
+        def _topk_ref_by_ratio(ratio: float):
+            k = int(ref_len * ratio)
+            k = max(1, min(ref_len, k))
+            topk_idx = torch.topk(scores, k, dim=1)[1]  # [B, k]
+            ref_in = torch.gather(ref_hs, 1, topk_idx.unsqueeze(-1).repeat(1, 1, ref_hs.size(-1)))  # [B,k,C]
+            return k, topk_idx, ref_in
 
-        # topk_values, topk_indexes = torch.topk(
-        #     prob.view(ref_hs_logits.shape[0], -1),
-        #     80 * self.num_ref_frames, dim=1
-        # )
-
-
-        k1 = min(ref_hs.shape[1], 80 * self.num_ref_frames)
-        assert k1 <= flat_len, (k1, flat_len)
-        topk_values, topk_indexes = torch.topk(
-            prob.view(ref_hs_logits.shape[0], -1),
-            k1, dim=1
-        )
-        topk_indexes = topk_indexes // ref_hs_logits.shape[2]
-        assert topk_indexes.max().item() < ref_len
-        assert topk_indexes.min().item() >= 0
-        ref_hs_input1 = torch.gather(ref_hs, 1, topk_indexes.unsqueeze(-1).repeat(1, 1, ref_hs.shape[-1]))
-        assert ref_hs_input1.shape[1] == k1, (ref_hs_input1.shape, k1)
+        k1, idx1, ref_hs_input1 = _topk_ref_by_ratio(0.8)
+        if self.training and (not hasattr(self, "_dbg_topk_unique_once")):
+            self._dbg_topk_unique_once = True
+            uniq = torch.unique(idx1.reshape(-1)).numel()
+            print("[TopK-unique] k1 =", k1, "unique =", uniq)
         cur_hs = self.temporal_query_layer1(cur_hs, ref_hs_input1)
-
-        # topk_values, topk_indexes = torch.topk(
-        #     prob.view(ref_hs_logits.shape[0], -1),
-        #     50 * self.num_ref_frames, dim=1
-        # )
-
-        k2 = min(ref_hs.shape[1], 50 * self.num_ref_frames)
-        assert k2 <= flat_len, (k2, flat_len)
-
-        topk_values, topk_indexes = torch.topk(
-            prob.view(ref_hs_logits.shape[0], -1),
-            k2, dim=1
-        )
-        topk_indexes = topk_indexes // ref_hs_logits.shape[2]
-        assert topk_indexes.max().item() < ref_len
-        assert topk_indexes.min().item() >= 0
-
-        ref_hs_input2 = torch.gather(ref_hs, 1, topk_indexes.unsqueeze(-1).repeat(1, 1, ref_hs.shape[-1]))
-        assert ref_hs_input2.shape[1] == k2, (ref_hs_input2.shape, k2)
-
+        
+        k2, idx2, ref_hs_input2 = _topk_ref_by_ratio(0.5)
         cur_hs = self.temporal_query_layer2(cur_hs, ref_hs_input2)
 
-
-        k3 = min(ref_hs.shape[1], 30 * self.num_ref_frames)
-        assert k3 <= flat_len, (k3, flat_len)
-
-        topk_values, topk_indexes = torch.topk(
-            prob.view(ref_hs_logits.shape[0], -1),
-            k3, dim=1
-        )
-        topk_indexes = topk_indexes // ref_hs_logits.shape[2]
-        assert topk_indexes.max().item() < ref_len
-        assert topk_indexes.min().item() >= 0
-        ref_hs_input3 = torch.gather(ref_hs, 1, topk_indexes.unsqueeze(-1).repeat(1, 1, ref_hs.shape[-1]))
-        assert ref_hs_input3.shape[1] == k3, (ref_hs_input3.shape, k3)
-
+        k3, idx3, ref_hs_input3 = _topk_ref_by_ratio(0.3)
         cur_hs = self.temporal_query_layer3(cur_hs, ref_hs_input3)
+
+        # debug print once (可保留一两次后删除)
+        if self.training and (not hasattr(self, "_dbg_topk_once")):
+            self._dbg_topk_once = True
+            print("[TopK-check] ref_len =", ref_len,
+                "k1/k2/k3 =", k1, k2, k3,
+                "ratios =", (0.8, 0.5, 0.3))
 
         if self.training and (not hasattr(self, "_dbg_topk_once")):
             self._dbg_topk_once = True
