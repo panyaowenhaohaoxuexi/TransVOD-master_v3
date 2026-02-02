@@ -7,7 +7,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # ------------------------------------------------------------------------
 
-
 import copy
 from typing import Optional, List
 import math
@@ -41,8 +40,6 @@ class DeformableTransformer(nn.Module):
         self.TDAM = bool(getattr(args, "tdam", False))
 
         self.cqs_topk = 0 if args is None else int(getattr(args, "cqs_topk", 0))
-
-        self.init_query_from_features = bool(getattr(args, "init_query_from_features", False))
 
 
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
@@ -217,47 +214,56 @@ class DeformableTransformer(nn.Module):
 
         bs, _, c = memory_vis.shape
 
+        # NOTE: tri-modal 版本暂时只保证 two_stage=False 可用
+        # 如果你一定要 two_stage=True：目前这里用 memory_vis 做 proposals（或你后续自行设计三路 proposals 融合）
         if self.two_stage:
-            # 1) 生成三模态 encoder proposals（two-stage）
-            out_mem_vis, out_prop_vis = self.gen_encoder_output_proposals(memory_vis, mask_flatten, spatial_shapes)
-            out_mem_ir,  out_prop_ir  = self.gen_encoder_output_proposals(memory_ir,  mask_flatten, spatial_shapes)
-            out_mem_sar, out_prop_sar = self.gen_encoder_output_proposals(memory_sar, mask_flatten, spatial_shapes)
+            # 1) 每模态各自产生 encoder proposals + 评分（DAMSDet/Deformable-DETR two-stage 风格）
+            out_mem_vis, out_prop = self.gen_encoder_output_proposals(memory_vis, mask_flatten, spatial_shapes)
+            out_mem_ir,  _        = self.gen_encoder_output_proposals(memory_ir,  mask_flatten, spatial_shapes)
+            out_mem_sar, _        = self.gen_encoder_output_proposals(memory_sar, mask_flatten, spatial_shapes)
 
-            # 2) 拼接后全局打分 Top-K（对齐 DAMSDet Competitive Query Selection 思路）
-            out_mem_cat  = torch.cat([out_mem_vis, out_mem_ir, out_mem_sar], dim=1)
-            out_prop_cat = torch.cat([out_prop_vis, out_prop_ir, out_prop_sar], dim=1)
-            mask_cat     = torch.cat([mask_flatten, mask_flatten, mask_flatten], dim=1)
-            valid_cat    = torch.isfinite(out_prop_cat).all(-1)
+            # 这两个用于 out['enc_outputs']（保持与原版一致：先用 VIS 的 encoder 输出）
+            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](out_mem_vis)
+            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](out_mem_vis) + out_prop
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](out_mem_cat)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](out_mem_cat) + out_prop_cat
+            # helper：从某模态 encoder 输出里取 topk proposals（按分类置信度）
+            def _topk_from_encoder(out_mem, k):
+                logits = self.decoder.class_embed[self.decoder.num_layers](out_mem)                 # [B, S, Ccls]
+                coords_unact = self.decoder.bbox_embed[self.decoder.num_layers](out_mem) + out_prop # [B, S, 4]
+                scores = logits.sigmoid().max(-1)[0]                                                # [B, S]
+                k = min(k, scores.shape[1])
+                topk_score, topk_idx = torch.topk(scores, k, dim=1)                                 # [B, k]
+                topk_coords_unact = torch.gather(coords_unact, 1, topk_idx.unsqueeze(-1).repeat(1, 1, 4))  # [B,k,4]
+                return topk_score, topk_coords_unact
 
-            # query-level score：max over classes（sigmoid 单调，不影响排序）
-            scores = enc_outputs_class.sigmoid().max(-1)[0]
-            scores = scores.masked_fill(mask_cat | (~valid_cat), float('-inf'))
+            k_mod = self.two_stage_num_proposals  # 通常等于 args.num_queries
+            s_vis, c_vis = _topk_from_encoder(out_mem_vis, k_mod)
+            s_ir,  c_ir  = _topk_from_encoder(out_mem_ir,  k_mod)
+            s_sar, c_sar = _topk_from_encoder(out_mem_sar, k_mod)
 
-            # 先取更大的候选池，再做二次筛选（便于后续替换更强的二次竞争评分）
-            k_pool = min(self.two_stage_num_proposals * 3, scores.shape[1])
-            topk_scores, topk_idx = torch.topk(scores, k_pool, dim=1)
+            # 2) 三模态候选池拼接后，再做一次 Competitive Query Selection（你要的关键）
+            cand_scores = torch.cat([s_vis, s_ir, s_sar], dim=1)     # [B, 3*k_mod]
+            cand_coords = torch.cat([c_vis, c_ir, c_sar], dim=1)     # [B, 3*k_mod, 4]
 
-            k_final = min(self.two_stage_num_proposals, k_pool)
-            _, rel_idx = torch.topk(topk_scores, k_final, dim=1)
-            final_idx = torch.gather(topk_idx, 1, rel_idx)
+            if self.training and (not hasattr(self, "_dbg_modal_cqs_once")):
+                self._dbg_modal_cqs_once = True
+                print("[Modal-CQS] k_mod =", k_mod,
+                    "k_final =", min(self.two_stage_num_proposals, cand_scores.shape[1]),
+                    "cand =", cand_scores.shape[1])
 
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, final_idx.unsqueeze(-1).repeat(1, 1, 4)
-            ).detach()
+
+            k_final = self.two_stage_num_proposals                   # 最终进入 decoder 的 query 数
+            k_final = min(k_final, cand_scores.shape[1])
+            _, final_idx = torch.topk(cand_scores, k_final, dim=1)   # [B, k_final]
+            topk_coords_unact = torch.gather(cand_coords, 1, final_idx.unsqueeze(-1).repeat(1, 1, 4))  # [B,k_final,4]
+
+            # 3) 用竞争筛选出的 topk proposals 初始化 decoder queries/reference_points
+            topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
 
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-            query_embed, tgt_from_pos = torch.split(pos_trans_out, c, dim=2)
-
-            # 可选：用被选中的 encoder token feature 初始化 tgt（更贴近 DAMSDet）
-            if self.init_query_from_features:
-                tgt = torch.gather(out_mem_cat, 1, final_idx.unsqueeze(-1).repeat(1, 1, c)).detach()
-            else:
-                tgt = tgt_from_pos
+            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
 
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
