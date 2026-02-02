@@ -217,20 +217,54 @@ class DeformableTransformer(nn.Module):
         # NOTE: tri-modal 版本暂时只保证 two_stage=False 可用
         # 如果你一定要 two_stage=True：目前这里用 memory_vis 做 proposals（或你后续自行设计三路 proposals 融合）
         if self.two_stage:
-            output_memory, output_proposals = self.gen_encoder_output_proposals(memory_vis, mask_flatten, spatial_shapes)
+            # 1) 每模态各自产生 encoder proposals + 评分（DAMSDet/Deformable-DETR two-stage 风格）
+            out_mem_vis, out_prop = self.gen_encoder_output_proposals(memory_vis, mask_flatten, spatial_shapes)
+            out_mem_ir,  _        = self.gen_encoder_output_proposals(memory_ir,  mask_flatten, spatial_shapes)
+            out_mem_sar, _        = self.gen_encoder_output_proposals(memory_sar, mask_flatten, spatial_shapes)
 
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+            # 这两个用于 out['enc_outputs']（保持与原版一致：先用 VIS 的 encoder 输出）
+            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](out_mem_vis)
+            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](out_mem_vis) + out_prop
 
-            topk = self.two_stage_num_proposals
-            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
-            topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1,
-                                             topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+            # helper：从某模态 encoder 输出里取 topk proposals（按分类置信度）
+            def _topk_from_encoder(out_mem, k):
+                logits = self.decoder.class_embed[self.decoder.num_layers](out_mem)                 # [B, S, Ccls]
+                coords_unact = self.decoder.bbox_embed[self.decoder.num_layers](out_mem) + out_prop # [B, S, 4]
+                scores = logits.sigmoid().max(-1)[0]                                                # [B, S]
+                k = min(k, scores.shape[1])
+                topk_score, topk_idx = torch.topk(scores, k, dim=1)                                 # [B, k]
+                topk_coords_unact = torch.gather(coords_unact, 1, topk_idx.unsqueeze(-1).repeat(1, 1, 4))  # [B,k,4]
+                return topk_score, topk_coords_unact
+
+            k_mod = self.two_stage_num_proposals  # 通常等于 args.num_queries
+            s_vis, c_vis = _topk_from_encoder(out_mem_vis, k_mod)
+            s_ir,  c_ir  = _topk_from_encoder(out_mem_ir,  k_mod)
+            s_sar, c_sar = _topk_from_encoder(out_mem_sar, k_mod)
+
+            # 2) 三模态候选池拼接后，再做一次 Competitive Query Selection（你要的关键）
+            cand_scores = torch.cat([s_vis, s_ir, s_sar], dim=1)     # [B, 3*k_mod]
+            cand_coords = torch.cat([c_vis, c_ir, c_sar], dim=1)     # [B, 3*k_mod, 4]
+
+            if self.training and (not hasattr(self, "_dbg_modal_cqs_once")):
+                self._dbg_modal_cqs_once = True
+                print("[Modal-CQS] k_mod =", k_mod,
+                    "k_final =", min(self.two_stage_num_proposals, cand_scores.shape[1]),
+                    "cand =", cand_scores.shape[1])
+
+
+            k_final = self.two_stage_num_proposals                   # 最终进入 decoder 的 query 数
+            k_final = min(k_final, cand_scores.shape[1])
+            _, final_idx = torch.topk(cand_scores, k_final, dim=1)   # [B, k_final]
+            topk_coords_unact = torch.gather(cand_coords, 1, final_idx.unsqueeze(-1).repeat(1, 1, 4))  # [B,k_final,4]
+
+            # 3) 用竞争筛选出的 topk proposals 初始化 decoder queries/reference_points
             topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
+
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
@@ -247,8 +281,8 @@ class DeformableTransformer(nn.Module):
         )
 
         inter_references_out = inter_references
-        if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+        # if self.two_stage:
+        #     return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
 
         if self.fixed_pretrained_model:
             # 旧代码里 detach 的是 memory/hs/inter_references；这里改成三路 memory 都 detach
@@ -335,7 +369,7 @@ class DeformableTransformer(nn.Module):
         last_reference_out_list = torch.chunk(last_reference_out, self.num_ref_frames + 1, dim=0)
 
         # ---- Per-frame Competitive Query Selection (CQS) before TQE ----
-        if (self.cqs_topk is not None) and (self.cqs_topk > 0):
+        if (not self.two_stage) and (self.cqs_topk is not None) and (self.cqs_topk > 0):
             def _select_topk(hs_frame, ref_frame):
                 logits = class_embed(hs_frame)              # [B, Q, num_classes]
                 scores = logits.sigmoid().max(-1)[0]        # [B, Q]
@@ -456,7 +490,23 @@ class DeformableTransformer(nn.Module):
             None, None
         )
 
-        return hs[:, 0:1, :, :], init_reference_out[0:1], inter_references_out[:, 0:1, :, :], None, None, final_hs, final_references_out
+        # --- select current-frame encoder outputs for two-stage ---
+        enc_outputs_class_cur = None
+        enc_outputs_coord_unact_cur = None
+        if self.two_stage:
+            # enc_outputs_*: [(K+1)*B, S, ...]  -> chunk into (K+1) pieces, take current frame [0]
+            enc_outputs_class_cur = torch.chunk(enc_outputs_class, self.num_ref_frames + 1, dim=0)[0]
+            enc_outputs_coord_unact_cur = torch.chunk(enc_outputs_coord_unact, self.num_ref_frames + 1, dim=0)[0]
+        # --- end ---
+
+        return (hs[:, 0:1, :, :],
+        init_reference_out[0:1],
+        inter_references_out[:, 0:1, :, :],
+        enc_outputs_class_cur,
+        enc_outputs_coord_unact_cur,
+        final_hs,
+        final_references_out)
+
 
 
 class TemporalQueryEncoderLayer(nn.Module):

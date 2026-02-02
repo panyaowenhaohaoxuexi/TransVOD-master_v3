@@ -18,11 +18,12 @@ def run_multi():
     args.backbone = "resnet50"
     args.epochs = 1          # 验证阶段建议 1
     args.num_feature_levels = 1
-    args.num_queries = 300
+    args.num_queries = 100
     args.dilation = True
     args.batch_size = 1
     args.num_ref_frames = 3
-    args.cqs_topk = 100   # 例如每帧筛到 100
+    args.cqs_topk = 0  # 例如每帧筛到 100
+    args.two_stage = True
     args.tdam = True
     args.lr_drop_epochs = [4, 6]
     args.num_workers = 0     # 验证阶段建议 0
