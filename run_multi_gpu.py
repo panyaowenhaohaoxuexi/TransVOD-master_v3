@@ -7,6 +7,12 @@ SAR_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/sar_root"
 
 SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD_model_pth/single_checkpoint0043.pth"
 
+# -------- Stage-2 warmup (mode-1: output mixing) --------
+# Set USE_WARMUP=False to disable.
+USE_WARMUP = True
+WARMUP_EPOCHS = 5
+WARMUP_SCHEDULE = "linear"  # {linear, cos}
+
 def run_multi():
     parser = train_main.get_args_parser()
     args = parser.parse_args([])
@@ -29,6 +35,11 @@ def run_multi():
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
     args.lr = 2e-5
+
+    # ===== Stage-2 warmup (mode-1) =====
+    args.warmup_enable = USE_WARMUP
+    args.warmup_epochs = WARMUP_EPOCHS
+    args.warmup_schedule = WARMUP_SCHEDULE
 
     # ===== 三路数据根目录分别设置 =====
     args.vid_path = VIS_PATH
