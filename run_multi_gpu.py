@@ -5,7 +5,7 @@ VIS_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/vis_root"
 IR_PATH  = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/ir_root"
 SAR_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/sar_root"
 
-SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD-master_yuanshi/pth/single_checkpoint0043.pth"
+SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD_model_pth/single_checkpoint0043.pth"
 
 def run_multi():
     parser = train_main.get_args_parser()
@@ -18,14 +18,14 @@ def run_multi():
     args.backbone = "resnet50"
     args.epochs = 1          # 验证阶段建议 1
     args.num_feature_levels = 1
-    args.num_queries = 100
+    args.num_queries = 300
     args.dilation = True
     args.batch_size = 1
     args.num_ref_frames = 3
     args.cqs_topk = 0  # 例如每帧筛到 100
     args.two_stage = True
     args.tdam = True
-    args.lr_drop_epochs = [4, 6]
+    args.lr_drop_epochs = [30, 40]
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
     args.lr = 2e-4
@@ -37,14 +37,14 @@ def run_multi():
     args.num_classes = 3
 
     # ===== 从单帧初始化 =====
-    args.coco_pretrain = False
-    args.resume = SINGLE_CKPT
+    args.coco_pretrain = False # 冻结非时序的参数
+    args.resume = SINGLE_CKPT # 从一个已有 checkpoint 恢复/初始化模型参数
 
     # ===== 验证阶段：只跑 eval 更快（可保留）=====
     args.eval = False
 
     # ===== 输出 =====
-    args.output_dir = "exps/_debug_multi3m_collate"
+    args.output_dir = "exps/multibaseline/mydata_stage2"
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ===== 设备 =====

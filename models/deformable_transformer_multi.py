@@ -365,10 +365,25 @@ class DeformableTransformer(nn.Module):
         # ------------------------------------------------------------------
         # Temporal Transformer
         # ------------------------------------------------------------------
+        # IMPORTANT (bugfix):
+        # The multi-frame collate function flattens (K+1) frames into dim0 in **sample-major** order:
+        #   [s0_f0, s0_f1, ..., s0_fK, s1_f0, s1_f1, ..., s1_fK, ...]
+        # Older code used torch.chunk(dim0, K+1) which assumes **time-major** order and breaks when batch_size>1.
+        # Here we reshape by (B, K+1, ...) to robustly split current/ref frames for any batch_size.
+        Kp1 = self.num_ref_frames + 1
+        if bs % Kp1 != 0:
+            raise ValueError(f"[multi-3m] dim0={bs} is not divisible by (num_ref_frames+1)={Kp1}. "
+                             f"Check multi-frame input packaging.")
+        B0 = bs // Kp1
+
+        def _split_sample_major(x: torch.Tensor):
+            """Split a tensor of shape [(B*(K+1)), ...] into a list length (K+1) of [B, ...] tensors."""
+            x = x.contiguous().view(B0, Kp1, *x.shape[1:])
+            return [x[:, t] for t in range(Kp1)]
         # 1) 构造当前帧三模态 memory tuple（给 temporal_decoder 用）
-        memory_list_vis = torch.chunk(memory_vis, self.num_ref_frames + 1, dim=0)
-        memory_list_ir = torch.chunk(memory_ir, self.num_ref_frames + 1, dim=0)
-        memory_list_sar = torch.chunk(memory_sar, self.num_ref_frames + 1, dim=0)
+        memory_list_vis = _split_sample_major(memory_vis)
+        memory_list_ir = _split_sample_major(memory_ir)
+        memory_list_sar = _split_sample_major(memory_sar)
 
         cur_memory_vis = memory_list_vis[0]
         cur_memory_ir = memory_list_ir[0]
@@ -378,7 +393,7 @@ class DeformableTransformer(nn.Module):
 
         # 2) TDAM（temporal_encoder_layer）相关只在 TDAM=True 时计算，避免 TDAM=False 仍执行 ref_memory 等逻辑
         if self.TDAM:
-            valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]  # [B, L, 2]
+            valid_ratios_cur = valid_ratios.contiguous().view(B0, Kp1, *valid_ratios.shape[1:])[:, 0]  # [B, L, 2]
 
             # print once
             if self.training and (not hasattr(self, "_dbg_tdam_once")):
@@ -401,7 +416,7 @@ class DeformableTransformer(nn.Module):
                 (ref_spatial_shapes.new_zeros((1,)), ref_spatial_shapes.prod(1).cumsum(0)[:-1])
             ).contiguous()
 
-            lvl_pos_list = torch.chunk(lvl_pos_embed_flatten, self.num_ref_frames + 1, dim=0)
+            lvl_pos_list = _split_sample_major(lvl_pos_embed_flatten)
             cur_pos_embed = lvl_pos_list[0]                 # [B, sum_hw, C]
             ref_pos_embed = torch.cat(lvl_pos_list[1:], 1)  # [B, K*sum_hw, C]
 
@@ -448,8 +463,8 @@ class DeformableTransformer(nn.Module):
         last_hs = hs[-1]
         last_reference_out = inter_references_out[-1]
 
-        last_hs_list = torch.chunk(last_hs, self.num_ref_frames + 1, dim=0)
-        last_reference_out_list = torch.chunk(last_reference_out, self.num_ref_frames + 1, dim=0)
+        last_hs_list = _split_sample_major(last_hs)
+        last_reference_out_list = _split_sample_major(last_reference_out)
 
         # ---- Per-frame Competitive Query Selection (CQS) before TQE ----
         if (not self.two_stage) and (self.cqs_topk is not None) and (self.cqs_topk > 0):
@@ -531,7 +546,7 @@ class DeformableTransformer(nn.Module):
 
         # 4) temporal decoder: 输入三模态当前帧 memory tuple
         # 注意：这里必须用 “原始 valid_ratios[0:1]” (shape [1, n_levels, 2])，不要用 TDAM 的 valid_ratios_ref
-        valid_ratios_cur = torch.chunk(valid_ratios, self.num_ref_frames + 1, dim=0)[0]
+        valid_ratios_cur = valid_ratios.contiguous().view(B0, Kp1, *valid_ratios.shape[1:])[:, 0]
         if self.use_msd_temporal_decoder:
             cur_src_cat, cur_shapes_cat, cur_lsi_cat, cur_ratios_cat, _ = self._pack_msd_triplet(
                 cur_memory_vis, cur_memory_ir, cur_memory_sar,
@@ -563,17 +578,24 @@ class DeformableTransformer(nn.Module):
         enc_outputs_coord_unact_cur = None
         if self.two_stage:
             # enc_outputs_*: [(K+1)*B, S, ...]  -> chunk into (K+1) pieces, take current frame [0]
-            enc_outputs_class_cur = torch.chunk(enc_outputs_class, self.num_ref_frames + 1, dim=0)[0]
-            enc_outputs_coord_unact_cur = torch.chunk(enc_outputs_coord_unact, self.num_ref_frames + 1, dim=0)[0]
+            enc_outputs_class_cur = enc_outputs_class.contiguous().view(B0, Kp1, *enc_outputs_class.shape[1:])[:, 0]
+            enc_outputs_coord_unact_cur = enc_outputs_coord_unact.contiguous().view(B0, Kp1, *enc_outputs_coord_unact.shape[1:])[:, 0]
         # --- end ---
 
-        return (hs[:, 0:1, :, :],
-        init_reference_out[0:1],
-        inter_references_out[:, 0:1, :, :],
-        enc_outputs_class_cur,
-        enc_outputs_coord_unact_cur,
-        final_hs,
-        final_references_out)
+        # Return only current-frame outputs for loss/heads. Keep batch dimension = B0 (not forced to 1).
+        hs_cur = hs.contiguous().view(hs.shape[0], B0, Kp1, *hs.shape[2:])[:, :, 0]
+        inter_ref_cur = inter_references_out.contiguous().view(inter_references_out.shape[0], B0, Kp1, *inter_references_out.shape[2:])[:, :, 0]
+        init_ref_cur = init_reference_out.contiguous().view(B0, Kp1, *init_reference_out.shape[1:])[:, 0]
+
+        return (
+            hs_cur,
+            init_ref_cur,
+            inter_ref_cur,
+            enc_outputs_class_cur,
+            enc_outputs_coord_unact_cur,
+            final_hs,
+            final_references_out
+        )
 
 
 
