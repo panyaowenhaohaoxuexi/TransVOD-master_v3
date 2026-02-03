@@ -502,6 +502,15 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
+    # Stage-2 warmup (multi-frame): mix static and temporal outputs early to avoid degrading a strong Stage-1 baseline.
+    parser.add_argument('--warmup_enable', action='store_true',
+                        help='enable warmup in Stage-2 training (mix static/temporal outputs)')
+    parser.add_argument('--warmup_epochs', default=5, type=int,
+                        help='number of warmup epochs for output-mix warmup (mode-1)')
+    parser.add_argument('--warmup_schedule', default='linear', type=str,
+                        choices=['linear', 'cos'],
+                        help='alpha schedule during warmup (linear or cosine)')
+
     return parser
 
 
@@ -765,7 +774,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
 
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args
         )
         lr_scheduler.step()
 

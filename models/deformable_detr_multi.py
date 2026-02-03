@@ -258,15 +258,33 @@ class DeformableDETR(nn.Module):
         if not self.two_stage:
             query_embeds = self.query_embed.weight
         # hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs, masks, pos, query_embeds, self.class_embed[-1])
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs_vis, srcs_ir, srcs_sar, masks, pos, query_embeds, self.class_embed[-1])
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(
+            srcs_vis, srcs_ir, srcs_sar, masks, pos, query_embeds, self.class_embed[-1]
+        )
 
-        outputs_classes = []
-        outputs_coords = []
-        
         out = {}
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+
+        # --- static (Stage-1 style) output from the per-frame decoder ---
+        # This is used for Stage-2 warmup (mode-1): output mixing between static and temporal heads.
+        # hs/inter_references returned by the multi-frame transformer are already **current-frame only**.
+        if (hs is not None) and (inter_references is not None):
+            static_hs = hs[-1]  # [B, Q, C]
+            static_ref = inter_references[-1]
+            static_layer_id = self.transformer.decoder.num_layers - 1
+            reference = inverse_sigmoid(static_ref)
+            output_class_static = self.class_embed[static_layer_id](static_hs)
+            tmp = self.bbox_embed[static_layer_id](static_hs)
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            output_coord_static = tmp.sigmoid()
+            out['static_pred_logits'] = output_class_static
+            out['static_pred_boxes'] = output_coord_static
      
         if final_hs is not None:
             reference = inverse_sigmoid(final_references_out)

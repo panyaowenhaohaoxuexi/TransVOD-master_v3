@@ -23,22 +23,66 @@ from datasets.data_prefetcher_multi import data_prefetcher
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, args=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    metric_logger.add_meter('warmup_alpha', utils.SmoothedValue(window_size=1, fmt='{value:.3f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
+
+    # warmup (mode-1): mix static and temporal outputs
+    warmup_enable = bool(getattr(args, 'warmup_enable', False)) if args is not None else False
+    warmup_epochs = int(getattr(args, 'warmup_epochs', 0)) if args is not None else 0
+    warmup_schedule = str(getattr(args, 'warmup_schedule', 'linear')) if args is not None else 'linear'
+
+    def _compute_alpha(ep: int) -> float:
+        if (not warmup_enable) or (warmup_epochs <= 0):
+            return 1.0
+        # make alpha=0 at the first warmup epoch and alpha=1 at the last warmup epoch
+        if warmup_epochs == 1:
+            t = 1.0
+        else:
+            t = float(ep) / float(warmup_epochs - 1)
+            t = max(0.0, min(1.0, t))
+        if warmup_schedule == 'cos':
+            return 0.5 * (1.0 - math.cos(math.pi * t))
+        return t
 
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
 
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         outputs = model(samples)
-        loss_dict = criterion(outputs, targets)
+
+        # ----- warmup (mode-1): output mixing -----
+        alpha = _compute_alpha(epoch)
+        use_mix = warmup_enable and (warmup_epochs > 0) and (epoch < warmup_epochs)
+        if use_mix:
+            if ('static_pred_logits' not in outputs) or ('static_pred_boxes' not in outputs):
+                raise KeyError("Warmup is enabled but model did not return static_pred_logits/static_pred_boxes.")
+            # mix final outputs only; drop aux_outputs during warmup to avoid early instability
+            static_logits = outputs['static_pred_logits']
+            static_boxes = outputs['static_pred_boxes']
+            temp_logits = outputs['pred_logits']
+            temp_boxes = outputs['pred_boxes']
+
+            mix_logits = (1.0 - alpha) * static_logits + alpha * temp_logits
+            mix_boxes = (1.0 - alpha) * static_boxes + alpha * temp_boxes
+
+            outputs_for_loss = {k: v for k, v in outputs.items()
+                                if k not in ['static_pred_logits', 'static_pred_boxes', 'aux_outputs']}
+            outputs_for_loss['pred_logits'] = mix_logits
+            outputs_for_loss['pred_boxes'] = mix_boxes
+        else:
+            # normal training: ignore static outputs in criterion
+            outputs_for_loss = {k: v for k, v in outputs.items()
+                                if k not in ['static_pred_logits', 'static_pred_boxes']}
+
+        loss_dict = criterion(outputs_for_loss, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
  
@@ -89,6 +133,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
+        metric_logger.update(warmup_alpha=alpha)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

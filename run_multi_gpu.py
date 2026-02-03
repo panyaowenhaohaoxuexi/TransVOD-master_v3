@@ -20,7 +20,7 @@ def run_multi():
     args.num_feature_levels = 1
     args.num_queries = 300
     args.dilation = True
-    args.batch_size = 1
+    args.batch_size = 2
     args.num_ref_frames = 3
     args.cqs_topk = 0  # 例如每帧筛到 100
     args.two_stage = True
@@ -28,7 +28,7 @@ def run_multi():
     args.lr_drop_epochs = [30, 40]
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
-    args.lr = 2e-4
+    args.lr = 2e-5
 
     # ===== 三路数据根目录分别设置 =====
     args.vid_path = VIS_PATH
