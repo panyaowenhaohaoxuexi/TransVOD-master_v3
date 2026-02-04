@@ -301,7 +301,7 @@ class DeformableDETR(nn.Module):
         
         # ===== warmup-eval consistency =====
         alpha = getattr(self, "_warmup_alpha", None)
-        if (alpha is not None) and (alpha <= 1e-12):
+        if (not self.training) and (alpha is not None) and (alpha <= 1e-12):
             if ("static_pred_logits" in out) and ("static_pred_boxes" in out):
                 out["pred_logits"] = out["static_pred_logits"]
                 out["pred_boxes"] = out["static_pred_boxes"]

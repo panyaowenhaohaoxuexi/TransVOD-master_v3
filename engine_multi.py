@@ -86,18 +86,33 @@ def train_one_epoch(
     warmup_enable = bool(getattr(args, "warmup_enable", False)) if args is not None else False
     warmup_epochs = int(getattr(args, "warmup_epochs", 0)) if args is not None else 0
 
+    # IMPORTANT:
+    # When Stage-2 freezes the whole static branch, warmup mixing with alpha==0 would make
+    # the mixed output depend only on frozen params -> losses.requires_grad=False -> backward() error.
+    # So during TRAINING we clamp alpha to a tiny positive value whenever warmup mixing is active.
+    alpha_min_train = 1e-3
+
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        # compute alpha BEFORE forward and expose to model for gating temporal ops
+        # warmup mixing active?
+        use_mix = warmup_enable and (warmup_epochs > 0) and (epoch < warmup_epochs)
+
+        # compute alpha BEFORE forward
         alpha = _compute_warmup_alpha(args, epoch)
+
+        # ---- TRAIN clamp (critical fix) ----
+        # If alpha==0 and we do output mixing, loss becomes pure static (frozen) -> no grad.
+        if use_mix and alpha <= 0.0:
+            alpha = alpha_min_train
+
+        # expose to model for gating temporal ops (alpha==0 often skips temporal blocks)
         _set_model_warmup_alpha(model, alpha)
 
         outputs = model(samples)
 
         # ----- warmup (mode-1): output mixing -----
-        use_mix = warmup_enable and (warmup_epochs > 0) and (epoch < warmup_epochs)
         if use_mix:
             if ("static_pred_logits" not in outputs) or ("static_pred_boxes" not in outputs):
                 raise KeyError("Warmup is enabled but model did not return static_pred_logits/static_pred_boxes.")
@@ -136,6 +151,15 @@ def train_one_epoch(
             sys.exit(1)
 
         optimizer.zero_grad()
+
+        # extra safety: if someone disables all trainable paths, fail with a clear message
+        if not losses.requires_grad:
+            raise RuntimeError(
+                "losses.requires_grad is False. This usually means all paths contributing to the loss "
+                "come from frozen parameters (e.g., warmup alpha==0 mixing to static branch while static is frozen). "
+                "Fix: keep alpha>0 during training warmup, and/or ensure pred_* is not overridden by static during training."
+            )
+
         losses.backward()
 
         if max_norm > 0:

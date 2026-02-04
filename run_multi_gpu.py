@@ -22,7 +22,7 @@ def run_multi():
 
     # ===== 对齐 r50_train_multi.sh（建议先验证用小配置）=====
     args.backbone = "resnet50"
-    args.epochs = 50          # 验证阶段建议 1
+    args.epochs = 1          # 验证阶段建议 1
     args.num_feature_levels = 1
     args.num_queries = 300
     args.dilation = True
