@@ -298,6 +298,14 @@ class DeformableDETR(nn.Module):
             output_coord = tmp.sigmoid()
             out["pred_logits"] = output_class
             out["pred_boxes"] = output_coord 
+        
+        # ===== warmup-eval consistency =====
+        alpha = getattr(self, "_warmup_alpha", None)
+        if (alpha is not None) and (alpha <= 1e-12):
+            if ("static_pred_logits" in out) and ("static_pred_boxes" in out):
+                out["pred_logits"] = out["static_pred_logits"]
+                out["pred_boxes"] = out["static_pred_boxes"]
+
         return out
 
     @torch.jit.unused

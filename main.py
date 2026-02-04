@@ -384,6 +384,36 @@ def main(args):
 
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(load_sd, strict=False)
 
+            # ===== warm-start temp heads from Stage-1 heads when resuming single->multi =====
+            # IMPORTANT: when two_stage=True, class_embed/bbox_embed has (dec_layers+1) heads;
+            # the last one (-1) is for encoder proposals. We should copy from the LAST DECODER layer head.
+            if (not args.coco_pretrain) and hasattr(model_without_ddp, "temp_class_embed"):
+                import torch.nn as nn
+                need = (missing_keys is not None) and any(
+                    k.startswith("temp_class_embed") or k.startswith("temp_bbox_embed")
+                    for k in missing_keys
+                )
+                if need:
+                    with torch.no_grad():
+                        last_dec_id = model_without_ddp.transformer.decoder.num_layers - 1
+
+                        # class head (use decoder last layer head)
+                        if isinstance(model_without_ddp.class_embed, nn.ModuleList):
+                            src_cls = model_without_ddp.class_embed[last_dec_id]
+                        else:
+                            src_cls = model_without_ddp.class_embed
+                        model_without_ddp.temp_class_embed.weight.copy_(src_cls.weight)
+                        model_without_ddp.temp_class_embed.bias.copy_(src_cls.bias)
+
+                        # box head (use decoder last layer head)
+                        if isinstance(model_without_ddp.bbox_embed, nn.ModuleList):
+                            src_box = model_without_ddp.bbox_embed[last_dec_id]
+                        else:
+                            src_box = model_without_ddp.bbox_embed
+                        model_without_ddp.temp_bbox_embed.load_state_dict(src_box.state_dict())
+
+                    print("[warmstart] copied decoder(last) class_embed/bbox_embed -> temp_*")
+
         unexpected_keys = [
             k for k in unexpected_keys
             if not (k.endswith('total_params') or k.endswith('total_ops'))
