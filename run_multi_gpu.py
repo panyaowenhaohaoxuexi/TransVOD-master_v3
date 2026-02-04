@@ -22,11 +22,11 @@ def run_multi():
 
     # ===== 对齐 r50_train_multi.sh（建议先验证用小配置）=====
     args.backbone = "resnet50"
-    args.epochs = 1          # 验证阶段建议 1
+    args.epochs = 50          # 验证阶段建议 1
     args.num_feature_levels = 1
     args.num_queries = 300
     args.dilation = True
-    args.batch_size = 2
+    args.batch_size = 4
     args.num_ref_frames = 3
     args.cqs_topk = 0  # 例如每帧筛到 100
     args.two_stage = True
@@ -34,8 +34,10 @@ def run_multi():
     args.lr_drop_epochs = [30, 40]
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
-    args.lr = 2e-5
+    args.lr = 2e-4
 
+    args.init_query_from_features = True  # 建议 True，更贴近 DAMSDet CQS
+    
     # ===== Stage-2 warmup (mode-1) =====
     args.warmup_enable = USE_WARMUP
     args.warmup_epochs = WARMUP_EPOCHS
