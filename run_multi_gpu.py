@@ -35,9 +35,12 @@ def run_multi():
     args.num_workers = 0     # 验证阶段建议 0
     args.with_box_refine = True
     args.lr = 2e-4
+    args.trimodal_decoder = True     # SAME as Stage-1
+    args.trimodal_fusion = "msd"     # 保险起见，单帧/多帧都设
+    args.trimodal_fusion_multi = "msd"
 
     args.init_query_from_features = True  # 建议 True，更贴近 DAMSDet CQS
-    
+
     # ===== Stage-2 warmup (mode-1) =====
     args.warmup_enable = USE_WARMUP
     args.warmup_epochs = WARMUP_EPOCHS

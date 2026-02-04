@@ -45,7 +45,8 @@ def run_singlebaseline():
     args.trimodal_decoder = True
     args.trimodal_fusion = "msd"      # "avg" / "gated" / "concat"
     args.init_query_from_features = True  # 建议 True，更贴近 DAMSDet CQS
-
+    args.trimodal_fusion_multi = "msd"
+    
     # output
     args.output_dir = "exps/singlebaseline/mydata_r50_singleScale_dc5_3m_stage1"
     os.makedirs(args.output_dir, exist_ok=True)
