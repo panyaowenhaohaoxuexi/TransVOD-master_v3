@@ -1,360 +1,3 @@
-# # 原始
-# # ------------------------------------------------------------------------
-# # Deformable DETR
-# # Copyright (c) 2020 SenseTime. All Rights Reserved.
-# # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# # ------------------------------------------------------------------------
-# # Modified from DETR (https://github.com/facebookresearch/detr)
-# # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-# # ------------------------------------------------------------------------
-
-
-# import argparse
-# import datetime
-# import json
-# import random
-# import time
-# from pathlib import Path
-
-# import numpy as np
-# import torch
-# from torch.utils.data import DataLoader
-# import datasets
-
-# import datasets.samplers as samplers
-# from datasets import build_dataset, get_coco_api_from_dataset
-# from models import build_model
-
-
-# def get_args_parser():
-#     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
-#     parser.add_argument('--lr', default=2e-4, type=float)
-#     parser.add_argument('--lr_backbone_names', default=["backbone.0"], type=str, nargs='+')
-#     parser.add_argument('--lr_backbone', default=2e-5, type=float)
-#     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
-#     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-#     parser.add_argument('--batch_size', default=2, type=int)
-#     parser.add_argument('--weight_decay', default=1e-4, type=float)
-#     parser.add_argument('--epochs', default=15, type=int)
-#     parser.add_argument('--lr_drop', default=5, type=int)
-#     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
-#     parser.add_argument('--clip_max_norm', default=0.1, type=float,
-#                         help='gradient clipping max norm')
-    
-#     parser.add_argument('--num_ref_frames', default=3, type=int, help='number of reference frames')
-
-#     parser.add_argument('--sgd', action='store_true')
-
-#     # Variants of Deformable DETR
-#     parser.add_argument('--with_box_refine', default=False, action='store_true')
-#     parser.add_argument('--two_stage', default=False, action='store_true')
-
-#     # Model parameters
-#     parser.add_argument('--frozen_weights', type=str, default=None,
-#                         help="Path to the pretrained model. If set, only the mask head will be trained")
-
-#     # * Backbone
-#     parser.add_argument('--backbone', default='resnet50', type=str,
-#                         help="Name of the convolutional backbone to use")
-#     parser.add_argument('--dilation', action='store_true',
-#                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
-#     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
-#                         help="Type of positional embedding to use on top of the image features")
-#     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float,
-#                         help="position / size * scale")
-#     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
-
-
-#     # * Transformer
-#     parser.add_argument('--enc_layers', default=6, type=int,
-#                         help="Number of encoding layers in the transformer")
-#     parser.add_argument('--dec_layers', default=6, type=int,
-#                         help="Number of decoding layers in the transformer")
-#     parser.add_argument('--dim_feedforward', default=1024, type=int,
-#                         help="Intermediate size of the feedforward layers in the transformer blocks")
-#     parser.add_argument('--hidden_dim', default=256, type=int,
-#                         help="Size of the embeddings (dimension of the transformer)")
-#     parser.add_argument('--dropout', default=0.1, type=float,
-#                         help="Dropout applied in the transformer")
-#     parser.add_argument('--nheads', default=8, type=int,
-#                         help="Number of attention heads inside the transformer's attentions")
-#     parser.add_argument('--num_queries', default=300, type=int,
-#                         help="Number of query slots")
-#     parser.add_argument('--dec_n_points', default=4, type=int)
-#     parser.add_argument('--enc_n_points', default=4, type=int)
-#     parser.add_argument('--n_temporal_decoder_layers', default=1, type=int)
-#     parser.add_argument('--interval1', default=20, type=int)
-#     parser.add_argument('--interval2', default=60, type=int)
-
-#     parser.add_argument("--fixed_pretrained_model", default=False, action='store_true')
-
-#     # * Segmentation
-#     parser.add_argument('--masks', action='store_true',
-#                         help="Train segmentation head if the flag is provided")
-
-#     # Loss
-#     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
-#                         help="Disables auxiliary decoding losses (loss at each layer)")
-
-#     # * Matcher
-#     parser.add_argument('--set_cost_class', default=2, type=float,
-#                         help="Class coefficient in the matching cost")
-#     parser.add_argument('--set_cost_bbox', default=5, type=float,
-#                         help="L1 box coefficient in the matching cost")
-#     parser.add_argument('--set_cost_giou', default=2, type=float,
-#                         help="giou box coefficient in the matching cost")
-
-#     # * Loss coefficients
-#     parser.add_argument('--mask_loss_coef', default=1, type=float)
-#     parser.add_argument('--dice_loss_coef', default=1, type=float)
-#     parser.add_argument('--cls_loss_coef', default=2, type=float)
-#     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-#     parser.add_argument('--giou_loss_coef', default=2, type=float)
-#     parser.add_argument('--focal_alpha', default=0.25, type=float)
-
-#     # dataset parameters
-#     parser.add_argument('--dataset_file', default='vid_multi')
-#     parser.add_argument('--coco_path', default='./data/coco', type=str)
-#     parser.add_argument('--vid_path', default='./data/vid', type=str)
-#     parser.add_argument('--coco_pretrain', default=False, action='store_true')
-#     parser.add_argument('--coco_panoptic_path', type=str)
-#     parser.add_argument('--remove_difficult', action='store_true')
-
-#     parser.add_argument('--output_dir', default='',
-#                         help='path where to save, empty for no saving')
-#     parser.add_argument('--device', default='cuda',
-#                         help='device to use for training / testing')
-#     parser.add_argument('--seed', default=42, type=int)
-#     parser.add_argument('--resume', default='', help='resume from checkpoint')
-#     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-#                         help='start epoch')
-#     parser.add_argument('--eval', action='store_true')
-#     parser.add_argument('--num_workers', default=0, type=int)
-#     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
-
-#     return parser
-
-
-# def main(args):
-#     print(args.dataset_file, 11111111)
-#     if args.dataset_file == "vid_single":
-#         from engine_single import evaluate, train_one_epoch
-#         import util.misc as utils
-        
-#     else:
-#         from engine_multi import evaluate, train_one_epoch
-#         import util.misc_multi as utils
-
-#     print(args.dataset_file)
-#     device = torch.device(args.device)
-#     utils.init_distributed_mode(args)
-#     print("git:\n  {}\n".format(utils.get_sha()))
-
-#     if args.frozen_weights is not None:
-#         assert args.masks, "Frozen training is meant for segmentation only"
-#     print(args)
-
-
-#     # fix the seed for reproducibility
-#     seed = args.seed + utils.get_rank()
-#     torch.manual_seed(seed)
-#     np.random.seed(seed)
-#     random.seed(seed)
-
-#     model, criterion, postprocessors = build_model(args)
-#     model.to(device)
-
-#     model_without_ddp = model
-#     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-#     print('number of params:', n_parameters)
-
-#     # 原始
-#     # dataset_train = build_dataset(image_set='train_joint', args=args)
-
-#     dataset_train = build_dataset(image_set='train_vid', args=args)
-
-#     dataset_val = build_dataset(image_set='val', args=args)
-
-#     if args.distributed:
-#         if args.cache_mode:
-#             sampler_train = samplers.NodeDistributedSampler(dataset_train)
-#             sampler_val = samplers.NodeDistributedSampler(dataset_val, shuffle=False)
-#         else:
-#             sampler_train = samplers.DistributedSampler(dataset_train)
-#             sampler_val = samplers.DistributedSampler(dataset_val, shuffle=False)
-#     else:
-#         sampler_train = torch.utils.data.RandomSampler(dataset_train)
-#         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-#     batch_sampler_train = torch.utils.data.BatchSampler(
-#         sampler_train, args.batch_size, drop_last=True)
-
-#     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-#                                    collate_fn=utils.collate_fn, num_workers=args.num_workers,
-#                                    pin_memory=True)
-#     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-#                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
-#                                  pin_memory=True)
-
-#     # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
-#     def match_name_keywords(n, name_keywords):
-#         out = False
-#         for b in name_keywords:
-#             if b in n:
-#                 out = True
-#                 break
-#         return out
-
-#     for n, p in model_without_ddp.named_parameters():
-#         print(n)
-
-#     param_dicts = [
-#         {
-#             "params":
-#                 [p for n, p in model_without_ddp.named_parameters()
-#                  if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-#             "lr": args.lr,
-#         },
-#         {
-#             "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
-#             "lr": args.lr_backbone,
-#         },
-#         {
-#             "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-#             "lr": args.lr * args.lr_linear_proj_mult,
-#         }
-#     ]
-#     if args.sgd:
-#         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-#                                     weight_decay=args.weight_decay)
-#     else:
-#         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-#                                       weight_decay=args.weight_decay)
-#     print(args.lr_drop_epochs)
-#     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs)
-
-#     if args.distributed:
-#         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-#         model_without_ddp = model.module
-
-#     if args.dataset_file == "coco_panoptic":
-#         # We also evaluate AP during panoptic training, on original coco DS
-#         coco_val = datasets.coco.build("val", args)
-#         base_ds = get_coco_api_from_dataset(coco_val)
-#     else:
-#         base_ds = get_coco_api_from_dataset(dataset_val)
-
-#     if args.frozen_weights is not None:
-#         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-#         model_without_ddp.detr.load_state_dict(checkpoint['model'])
-
-#     output_dir = Path(args.output_dir)
-#     if args.resume:
-#         if args.resume.startswith('https'):
-#             checkpoint = torch.hub.load_state_dict_from_url(
-#                 args.resume, map_location='cpu', check_hash=True)
-#         else:
-#             checkpoint = torch.load(args.resume, map_location='cpu')
-
-#         if args.eval:
-#             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-#         else:
-#             tmp_dict = model_without_ddp.state_dict().copy()
-#             if args.coco_pretrain: # singleBaseline
-#                 for k, v in checkpoint['model'].items():
-#                     if ('class_embed' not in k) :
-#                         tmp_dict[k] = v 
-#                     else:
-#                         print('k', k)
-#             else:
-#                 tmp_dict = checkpoint['model']
-#                 for name, param in model_without_ddp.named_parameters():
-# 	                if ('temp' in name):
-# 	                    param.requires_grad = True
-# 	                else:
-# 	                    param.requires_grad = False
-#             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)
-
-#         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
-#         if len(missing_keys) > 0:
-#             print('Missing Keys: {}'.format(missing_keys))
-#         if len(unexpected_keys) > 0:
-#             print('Unexpected Keys: {}'.format(unexpected_keys))
-#     if args.eval:
-#         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-#                                               data_loader_val, base_ds, device, args.output_dir)
-#         if args.output_dir:
-#             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
-#         return
-
-#     print("Start training")
-#     start_time = time.time()
-#     for epoch in range(args.start_epoch, args.epochs):
-#         if args.distributed:
-#             sampler_train.set_epoch(epoch)
-#         train_stats = train_one_epoch(
-#             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-#         lr_scheduler.step()
-#         print('args.output_dir', args.output_dir)
-#         if args.output_dir:
-#             checkpoint_paths = [output_dir / 'checkpoint.pth']
-#             # extra checkpoint before LR drop and every 5 epochs
-#             # if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 1 == 0:
-#             if (epoch + 1) % 1 == 0:
-#                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-#             for checkpoint_path in checkpoint_paths:
-#                 utils.save_on_master({
-#                     'model': model_without_ddp.state_dict(),
-#                     'optimizer': optimizer.state_dict(),
-#                     'lr_scheduler': lr_scheduler.state_dict(),
-#                     'epoch': epoch,
-#                     'args': args,
-#                 }, checkpoint_path)
-
-#         # 原始
-#         #test_stats, coco_evaluator = evaluate(
-#          #   model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-#         #)
-        
-        
-#         test_stats, coco_evaluator = evaluate(
-#            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-#         )
-        
-        
-        
-        
-#         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-#                      'epoch': epoch,
-#                      'n_parameters': n_parameters}
-
-#         if args.output_dir and utils.is_main_process():
-#             with (output_dir / "log.txt").open("a") as f:
-#                 f.write(json.dumps(log_stats) + "\n")
-
-#     total_time = time.time() - start_time
-#     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-#     print('Training time {}'.format(total_time_str))
-
-
-# if __name__ == '__main__':
-#     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])
-#     args = parser.parse_args()
-#     if args.output_dir:
-#         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-#     main(args)
-
-# # 修改权重保存逻辑
-
-# ------------------------------------------------------------------------
-# Deformable DETR
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-# ------------------------------------------------------------------------
-
 import argparse
 import datetime
 import json
@@ -370,7 +13,6 @@ import datasets
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 
-# ===== 修改点 1：不要再用 build_model =====
 # from models import build_model
 from models import build_single, build_multi
 
@@ -398,10 +40,9 @@ def get_args_parser():
     parser.add_argument('--two_stage', default=False, action='store_true')
 
     parser.add_argument('--cqs_topk', default=0, type=int,
-                    help='per-frame Competitive Query Selection topk before TQE; 0 disables')
+                        help='per-frame Competitive Query Selection topk before TQE; 0 disables')
 
-
-## 修改
+    # tri-modal
     parser.add_argument('--trimodal_decoder', default=False, action='store_true',
                         help='use tri-modal query-fusion decoder for (VIS/IR/SAR)')
     parser.add_argument('--trimodal_fusion', default='avg', type=str,
@@ -517,16 +158,8 @@ def get_args_parser():
 def main(args):
     print(args.dataset_file, 11111111)
 
-    # ===== 修改点 2：统一 single/multi 判定（vid_single_3m 也算 single） =====
+    # ===== single/multi 判定（vid_single_3m 也算 single） =====
     is_single = args.dataset_file in ["vid_single", "vid_single_3m"]
-
-    # # choose engine/utils
-    # if is_single:
-    #     from engine_single import evaluate, train_one_epoch
-    #     import util.misc as utils
-    # else:
-    #     from engine_multi import evaluate, train_one_epoch
-    #     import util.misc_multi as utils
 
     # choose engine/utils
     if is_single:
@@ -535,12 +168,10 @@ def main(args):
     else:
         from engine_multi import evaluate, train_one_epoch
         if args.dataset_file == "vid_multi_3m":
-            import util.misc_multi_3m as utils   # 关键：三模态多帧 split(9)
+            import util.misc_multi_3m as utils   # 三模态多帧 split(9)
         else:
             import util.misc_multi as utils      # 原来的单模态 multi
 
-
-    print(args.dataset_file)
     device = torch.device(args.device)
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -555,21 +186,18 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
-    # ===== 修改点 3：显式按 is_single 构建模型（避免 build_model 误判） =====
+    # ===== 显式按 is_single 构建模型 =====
     if is_single:
         model, criterion, postprocessors = build_single(args)
     else:
         model, criterion, postprocessors = build_multi(args)
 
     model.to(device)
-
     model_without_ddp = model
 
     print("[where-am-i] model class:", model_without_ddp.__class__)
     print("[where-am-i] transformer class:", model_without_ddp.transformer.__class__)
     print("[where-am-i] transformer module:", model_without_ddp.transformer.__class__.__module__)
-
-
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -616,7 +244,7 @@ def main(args):
                 return True
         return False
 
-    for n, p in model_without_ddp.named_parameters():
+    for n, _ in model_without_ddp.named_parameters():
         print(n)
 
     param_dicts = [
@@ -650,7 +278,6 @@ def main(args):
     else:
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
 
-
     # ===== optimizer check =====
     opt_params = []
     for g in optimizer.param_groups:
@@ -663,9 +290,6 @@ def main(args):
     print("[opt-check] optimizer params:", len(opt_params))
     print("[opt-check] trainable params:", len(trainable_params))
     print("[opt-check] optimizer==trainable:", opt_params_set == trainable_set)
-
-
-
 
     print(args.lr_drop_epochs)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs)
@@ -697,50 +321,68 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
 
+        ckpt_sd_raw = checkpoint.get("model", checkpoint)
+
+        # ---- eval: load everything possible (key in model + shape match) ----
         if args.eval:
-            # missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-            
-            state_dict = checkpoint['model']
-            # 删掉类别头，避免 31->3 的 shape mismatch
-            state_dict = {k: v for k, v in state_dict.items() if not k.startswith('class_embed')}
-            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
+            model_sd_now = model_without_ddp.state_dict()
+            eval_sd = {k: v for k, v in ckpt_sd_raw.items()
+                       if (k in model_sd_now) and (model_sd_now[k].shape == v.shape)}
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(eval_sd, strict=False)
 
-
-
+        # ---- train ----
         else:
-            tmp_dict = model_without_ddp.state_dict().copy()
-            if args.coco_pretrain:  # singleBaseline: load everything except class_embed
-                for k, v in checkpoint['model'].items():
-                    if 'class_embed' not in k:
-                        tmp_dict[k] = v
-                    else:
-                        print('k', k)
-            else:
-                # temporal finetune stage: freeze non-temporal params
-                tmp_dict = checkpoint['model']
+            # freeze non-temporal params only when doing temporal finetune stage (coco_pretrain==False)
+            if not args.coco_pretrain:
                 for name, param in model_without_ddp.named_parameters():
-                    if 'temp' in name:
+                    # train temporal transformer blocks + temporal heads
+                    # temporal blocks are named "transformer.temporal_*"
+                    # temporal heads are named "temp_*"
+                    if ("temporal" in name) or name.startswith("temp_"):
                         param.requires_grad = True
                     else:
                         param.requires_grad = False
 
+                trainable = [n for n, p in model_without_ddp.named_parameters() if p.requires_grad]
+                frozen = [n for n, p in model_without_ddp.named_parameters() if not p.requires_grad]
+                print("[freeze-check] trainable:", len(trainable), "frozen:", len(frozen))
+                print("[freeze-check] first trainable:", trainable[:20])
 
-            trainable = [n for n, p in model_without_ddp.named_parameters() if p.requires_grad]
-            frozen = [n for n, p in model_without_ddp.named_parameters() if not p.requires_grad]
-            print("[freeze-check] trainable:", len(trainable), "frozen:", len(frozen))
-            print("[freeze-check] first trainable:", trainable[:20])
-
-            # ===== 3) 过滤 ckpt（推荐：class_embed + shape）=====
+            # ---------- load by (key in model) AND (shape match), DO NOT drop class_embed blindly ----------
             model_sd = model_without_ddp.state_dict()
-            tmp_dict = {k: v for k, v in tmp_dict.items() if not k.startswith("class_embed")}
-            tmp_dict = {k: v for k, v in tmp_dict.items() if (k in model_sd and model_sd[k].shape == v.shape)}
+            load_sd = {k: v for k, v in ckpt_sd_raw.items()
+                       if (k in model_sd) and (tuple(model_sd[k].shape) == tuple(v.shape))}
 
+            # ===== debug: resume coverage =====
+            in_model = [k for k in ckpt_sd_raw.keys() if k in model_sd]
+            not_in_model = [k for k in ckpt_sd_raw.keys() if k not in model_sd]
+            shape_mismatch = [k for k in in_model if tuple(ckpt_sd_raw[k].shape) != tuple(model_sd[k].shape)]
+            loadable = list(load_sd.keys())
 
-            # # missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)
-            # tmp_dict = {k: v for k, v in tmp_dict.items() if not k.startswith("class_embed")}
+            print("====== [resume-debug] ckpt keys:", len(ckpt_sd_raw))
+            print("====== [resume-debug] model keys:", len(model_sd))
+            print("====== [resume-debug] ckpt keys in model:", len(in_model))
+            print("====== [resume-debug] ckpt keys NOT in model:", len(not_in_model))
+            print("====== [resume-debug] shape mismatch:", len(shape_mismatch))
+            print("====== [resume-debug] loadable(after key+shape):", len(loadable))
 
-            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(tmp_dict, strict=False)   
+            critical_prefix = ["backbone", "transformer", "input_proj", "bbox_embed", "class_embed", "temp"]
+            for p in critical_prefix:
+                c_in = sum(k.startswith(p) for k in ckpt_sd_raw.keys())
+                c_load = sum(k.startswith(p) for k in loadable)
+                print(f"====== [resume-debug] prefix={p:12s} ckpt={c_in:4d} loadable={c_load:4d}")
 
+            print("====== [resume-debug] examples NOT in model:", not_in_model[:20])
+            print("====== [resume-debug] examples shape mismatch:", shape_mismatch[:20])
+
+            denom = len([k for k in ckpt_sd_raw.keys() if k in model_sd])
+            if denom > 0 and len(loadable) < 0.7 * denom:
+                raise RuntimeError(
+                    "Resume coverage too low: most ckpt params are not loaded. "
+                    "Check key names / shapes."
+                )
+
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(load_sd, strict=False)
 
         unexpected_keys = [
             k for k in unexpected_keys
@@ -753,8 +395,10 @@ def main(args):
 
     # ===== eval-only =====
     if args.eval:
+        # pass args/epoch so evaluate can apply the same warmup rule as train (critical for alpha=0)
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+            args=args, epoch=args.start_epoch
         )
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -764,10 +408,10 @@ def main(args):
     print("Start training")
     start_time = time.time()
 
-    # best metric uses mAP50 (AP@0.50) as requested
+    # best metric uses mAP50 (AP@0.50)
     best_metric = -1.0
     best_epoch = -1
-    best_epoch_ckpt_path = None  # track the epoch-checkpoint of current best (so we can delete old best later)
+    best_epoch_ckpt_path = None
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -801,8 +445,10 @@ def main(args):
             }, epoch_ckpt_path)
 
         # ---- validate each epoch ----
+        # pass args/epoch so evaluate uses warmup alpha consistent with train
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+            args=args, epoch=epoch
         )
 
         # ---- extract mAP50:95 and mAP50 ----
@@ -816,7 +462,7 @@ def main(args):
                 cur_ap5095, cur_ap50 = None, None
 
         # ---- choose best by mAP50 ----
-        key_metric = cur_ap50  # mAP50 (AP@0.50)
+        key_metric = cur_ap50
         is_best = False
 
         if (key_metric is not None) and args.output_dir and utils.is_main_process() and (key_metric > best_metric):

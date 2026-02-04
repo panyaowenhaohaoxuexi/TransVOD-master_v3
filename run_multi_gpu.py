@@ -5,8 +5,8 @@ VIS_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/vis_root"
 IR_PATH  = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/ir_root"
 SAR_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/sar_root"
 
-SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD_model_pth/single_checkpoint0043.pth"
-
+SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD_model_pth/Tri_modal_single/best.pth"
+# "D:\Tri_modal_temp_code\TransVOD_model_pth\Tri_modal_single\best.pth"
 # -------- Stage-2 warmup (mode-1: output mixing) --------
 # Set USE_WARMUP=False to disable.
 USE_WARMUP = True

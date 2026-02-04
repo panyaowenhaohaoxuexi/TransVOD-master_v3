@@ -220,7 +220,9 @@ class DeformableTransformer(nn.Module):
         reference_points = reference_points[:, :, None] * valid_ratios[:, None]
         return reference_points
 
-    def forward(self, srcs_vis, srcs_ir, srcs_sar, masks, pos_embeds, query_embed=None, class_embed=None):
+    def forward(self, srcs_vis, srcs_ir, srcs_sar, masks, pos_embeds,
+            query_embed=None, class_embed=None, warmup_alpha: Optional[float] = None):
+
         assert self.two_stage or query_embed is not None
 
         # --- tri-modal flatten ---
@@ -365,6 +367,69 @@ class DeformableTransformer(nn.Module):
         # ------------------------------------------------------------------
         # Temporal Transformer
         # ------------------------------------------------------------------
+        # ===== warmup gate: if alpha<=0, skip all temporal ops and make temporal outputs == static current-frame outputs =====
+        if warmup_alpha is not None and warmup_alpha <= 1e-12:
+            Kp1 = self.num_ref_frames + 1
+            if bs % Kp1 != 0:
+                raise ValueError(f"[multi-3m] dim0={bs} is not divisible by (num_ref_frames+1)={Kp1}. "
+                                f"Check multi-frame input packaging.")
+            B0 = bs // Kp1
+
+            def _split_sample_major(x: torch.Tensor):
+                x = x.contiguous().view(B0, Kp1, *x.shape[1:])
+                return [x[:, t] for t in range(Kp1)]
+
+            # static last layer outputs per-frame
+            last_hs = hs[-1]  # [(K+1)*B, Q, C]
+            last_reference_out = inter_references_out[-1]  # [(K+1)*B, Q, 2 or 4]
+            last_hs_list = _split_sample_major(last_hs)
+            last_reference_out_list = _split_sample_major(last_reference_out)
+
+            # temporal outputs forced to current-frame static
+            final_hs = last_hs_list[0]                 # [B, Q, C]
+            final_references_out = last_reference_out_list[0]  # [B, Q, 2/4]
+
+            # two-stage current-frame encoder outputs (if enabled)
+            enc_outputs_class_cur = None
+            enc_outputs_coord_unact_cur = None
+            if self.two_stage:
+                enc_outputs_class_cur = enc_outputs_class.contiguous().view(B0, Kp1, *enc_outputs_class.shape[1:])[:, 0]
+                enc_outputs_coord_unact_cur = enc_outputs_coord_unact.contiguous().view(B0, Kp1, *enc_outputs_coord_unact.shape[1:])[:, 0]
+
+            # current-frame decoder outputs for static heads
+            hs_cur = hs.contiguous().view(hs.shape[0], B0, Kp1, *hs.shape[2:])[:, :, 0]
+            inter_ref_cur = inter_references_out.contiguous().view(inter_references_out.shape[0], B0, Kp1, *inter_references_out.shape[2:])[:, :, 0]
+            init_ref_cur = init_reference_out.contiguous().view(B0, Kp1, *init_reference_out.shape[1:])[:, 0]
+
+            # optional: one-time debug
+            if self.training and (not hasattr(self, "_dbg_warmup_skip_once")):
+                self._dbg_warmup_skip_once = True
+                print("[warmup-skip] warmup_alpha<=0, skip TDAM/TQE/temporal-decoder; temporal outputs = static current-frame")
+
+            return (
+                hs_cur,
+                init_ref_cur,
+                inter_ref_cur,
+                enc_outputs_class_cur,
+                enc_outputs_coord_unact_cur,
+                final_hs,
+                final_references_out
+            )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
         # IMPORTANT (bugfix):
         # The multi-frame collate function flattens (K+1) frames into dim0 in **sample-major** order:
         #   [s0_f0, s0_f1, ..., s0_fK, s1_f0, s1_f1, ..., s1_fK, ...]

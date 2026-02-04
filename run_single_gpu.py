@@ -25,7 +25,7 @@ def run_singlebaseline():
     args.batch_size = 1
     args.num_workers = 2
 
-    args.num_feature_levels = 1   # must match single_scale weights
+    args.num_feature_levels = 3   # must match single_scale weights
     args.num_queries = 300
     args.dilation = True          # must match dc5
     args.with_box_refine = True

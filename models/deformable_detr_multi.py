@@ -259,8 +259,8 @@ class DeformableDETR(nn.Module):
             query_embeds = self.query_embed.weight
         # hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(srcs, masks, pos, query_embeds, self.class_embed[-1])
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, final_hs, final_references_out = self.transformer(
-            srcs_vis, srcs_ir, srcs_sar, masks, pos, query_embeds, self.class_embed[-1]
-        )
+            srcs_vis, srcs_ir, srcs_sar, masks, pos, query_embeds, self.class_embed[-1], warmup_alpha=getattr(self, "_warmup_alpha", None))
+
 
         out = {}
         if self.two_stage:
