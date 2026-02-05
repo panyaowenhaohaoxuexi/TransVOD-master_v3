@@ -45,6 +45,12 @@ def run_multi():
     args.warmup_enable = USE_WARMUP
     args.warmup_epochs = WARMUP_EPOCHS
     args.warmup_schedule = WARMUP_SCHEDULE
+    
+    # ===== Stage-C: unfreeze spatial decoder last layers (after warmup) =====
+    args.unfreeze_decoder_last_n = 2
+    args.unfreeze_decoder_start_epoch = args.warmup_epochs  # warmup 结束后（epoch==5）开始
+    args.lr_decoder = 1e-5
+
 
     # ===== 三路数据根目录分别设置 =====
     args.vid_path = VIS_PATH

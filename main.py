@@ -13,7 +13,6 @@ import datasets
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 
-# from models import build_model
 from models import build_single, build_multi
 
 
@@ -152,6 +151,14 @@ def get_args_parser():
                         choices=['linear', 'cos'],
                         help='alpha schedule during warmup (linear or cosine)')
 
+    # Stage-2 progressive unfreeze (Stage-C): unfreeze spatial decoder last layers for higher upper bound
+    parser.add_argument('--unfreeze_decoder_last_n', default=0, type=int,
+                        help='unfreeze last N layers of spatial decoder in Stage-2 (0 disables)')
+    parser.add_argument('--unfreeze_decoder_start_epoch', default=-1, type=int,
+                        help='epoch to start unfreezing decoder last layers; -1 means warmup_epochs')
+    parser.add_argument('--lr_decoder', default=1e-5, type=float,
+                        help='learning rate for unfrozen spatial decoder layers')
+
     return parser
 
 
@@ -199,9 +206,6 @@ def main(args):
     print("[where-am-i] transformer class:", model_without_ddp.transformer.__class__)
     print("[where-am-i] transformer module:", model_without_ddp.transformer.__class__.__module__)
 
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
-
     # ===== dataset =====
     dataset_train = build_dataset(image_set='train_vid', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -244,62 +248,84 @@ def main(args):
                 return True
         return False
 
-    for n, _ in model_without_ddp.named_parameters():
-        print(n)
+    # ===== stage-C helpers =====
+    def build_optimizer_and_scheduler():
+        # If lr_drop_epochs is None, fall back to [lr_drop]
+        milestones = args.lr_drop_epochs
+        if milestones is None:
+            milestones = [int(args.lr_drop)]
+        print("[lr] milestones:", milestones)
 
-    param_dicts = [
-        {
-            "params": [
-                p for n, p in model_without_ddp.named_parameters()
-                if not match_name_keywords(n, args.lr_backbone_names)
-                and not match_name_keywords(n, args.lr_linear_proj_names)
-                and p.requires_grad
-            ],
-            "lr": args.lr,
-        },
-        {
-            "params": [
-                p for n, p in model_without_ddp.named_parameters()
-                if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad
-            ],
-            "lr": args.lr_backbone,
-        },
-        {
-            "params": [
-                p for n, p in model_without_ddp.named_parameters()
-                if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad
-            ],
-            "lr": args.lr * args.lr_linear_proj_mult,
-        }
-    ]
+        param_dicts = [
+            {
+                "params": [
+                    p for n, p in model_without_ddp.named_parameters()
+                    if not match_name_keywords(n, args.lr_backbone_names)
+                    and not match_name_keywords(n, args.lr_linear_proj_names)
+                    and p.requires_grad
+                ],
+                "lr": args.lr,
+            },
+            {
+                "params": [
+                    p for n, p in model_without_ddp.named_parameters()
+                    if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad
+                ],
+                "lr": args.lr_backbone,
+            },
+            {
+                "params": [
+                    p for n, p in model_without_ddp.named_parameters()
+                    if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad
+                ],
+                "lr": args.lr * args.lr_linear_proj_mult,
+            }
+        ]
 
-    if args.sgd:
-        optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+        if args.sgd:
+            opt = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+        else:
+            opt = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
 
-    # ===== optimizer check =====
-    opt_params = []
-    for g in optimizer.param_groups:
-        opt_params += list(g["params"])
+        sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones)
+        return opt, sch, milestones
 
-    opt_params_set = set([id(p) for p in opt_params])
-    trainable_params = [p for p in model_without_ddp.parameters() if p.requires_grad]
-    trainable_set = set([id(p) for p in trainable_params])
+    def unfreeze_spatial_decoder_last_layers(n_last: int):
+        """
+        Unfreeze last n_last layers of spatial decoder:
+        names start with 'transformer.decoder.layers.{i}.'
+        """
+        if n_last <= 0:
+            return [], None
 
-    print("[opt-check] optimizer params:", len(opt_params))
-    print("[opt-check] trainable params:", len(trainable_params))
-    print("[opt-check] optimizer==trainable:", opt_params_set == trainable_set)
+        dec = model_without_ddp.transformer.decoder
+        num_layers = int(getattr(dec, "num_layers", 0))
+        if num_layers <= 0:
+            num_layers = len(dec.layers)
 
-    print(args.lr_drop_epochs)
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs)
+        start = max(0, num_layers - int(n_last))
+        end = num_layers - 1
+        prefixes = tuple([f"transformer.decoder.layers.{i}." for i in range(start, num_layers)])
 
+        new_params = []
+        new_names = []
+        for name, p in model_without_ddp.named_parameters():
+            if name.startswith(prefixes):
+                if not p.requires_grad:
+                    p.requires_grad = True
+                    new_params.append(p)
+                    new_names.append(name)
+
+        return new_params, (start, end), new_names
+
+    # ===== DDP wrap (keep same as your original flow) =====
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.gpu], find_unused_parameters=True
         )
         model_without_ddp = model.module
 
+    # ===== base ds for eval =====
     if args.dataset_file == "coco_panoptic":
         coco_val = datasets.coco.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
@@ -335,9 +361,6 @@ def main(args):
             # freeze non-temporal params only when doing temporal finetune stage (coco_pretrain==False)
             if not args.coco_pretrain:
                 for name, param in model_without_ddp.named_parameters():
-                    # train temporal transformer blocks + temporal heads
-                    # temporal blocks are named "transformer.temporal_*"
-                    # temporal heads are named "temp_*"
                     if ("temporal" in name) or name.startswith("temp_"):
                         param.requires_grad = True
                     else:
@@ -348,7 +371,7 @@ def main(args):
                 print("[freeze-check] trainable:", len(trainable), "frozen:", len(frozen))
                 print("[freeze-check] first trainable:", trainable[:20])
 
-            # ---------- load by (key in model) AND (shape match), DO NOT drop class_embed blindly ----------
+            # ---------- load by (key in model) AND (shape match) ----------
             model_sd = model_without_ddp.state_dict()
             load_sd = {k: v for k, v in ckpt_sd_raw.items()
                        if (k in model_sd) and (tuple(model_sd[k].shape) == tuple(v.shape))}
@@ -367,10 +390,10 @@ def main(args):
             print("====== [resume-debug] loadable(after key+shape):", len(loadable))
 
             critical_prefix = ["backbone", "transformer", "input_proj", "bbox_embed", "class_embed", "temp"]
-            for p in critical_prefix:
-                c_in = sum(k.startswith(p) for k in ckpt_sd_raw.keys())
-                c_load = sum(k.startswith(p) for k in loadable)
-                print(f"====== [resume-debug] prefix={p:12s} ckpt={c_in:4d} loadable={c_load:4d}")
+            for pfx in critical_prefix:
+                c_in = sum(k.startswith(pfx) for k in ckpt_sd_raw.keys())
+                c_load = sum(k.startswith(pfx) for k in loadable)
+                print(f"====== [resume-debug] prefix={pfx:12s} ckpt={c_in:4d} loadable={c_load:4d}")
 
             print("====== [resume-debug] examples NOT in model:", not_in_model[:20])
             print("====== [resume-debug] examples shape mismatch:", shape_mismatch[:20])
@@ -425,7 +448,6 @@ def main(args):
 
     # ===== eval-only =====
     if args.eval:
-        # pass args/epoch so evaluate can apply the same warmup rule as train (critical for alpha=0)
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
             args=args, epoch=args.start_epoch
@@ -434,18 +456,68 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
+    # ===== build optimizer/scheduler AFTER resume+freeze (critical for Stage-2 finetune) =====
+    optimizer, lr_scheduler, milestones = build_optimizer_and_scheduler()
+
+    # ===== optimizer check =====
+    opt_params = []
+    for g in optimizer.param_groups:
+        opt_params += list(g["params"])
+    opt_params_set = set([id(p) for p in opt_params])
+    trainable_params = [p for p in model_without_ddp.parameters() if p.requires_grad]
+    trainable_set = set([id(p) for p in trainable_params])
+    print("[opt-check] optimizer params:", len(opt_params))
+    print("[opt-check] trainable params:", len(trainable_params))
+    print("[opt-check] optimizer==trainable:", opt_params_set == trainable_set)
+
+    # total/trainable params log
+    n_total = sum(p.numel() for p in model_without_ddp.parameters())
+    n_trainable = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
+    print("number of params (total):", n_total)
+    print("number of params (trainable):", n_trainable)
+
     # ===== training with per-epoch validation + best checkpoint + delete non-best epoch ckpt =====
     print("Start training")
     start_time = time.time()
 
-    # best metric uses mAP50 (AP@0.50)
     best_metric = -1.0
     best_epoch = -1
     best_epoch_ckpt_path = None
 
+    stage_c_done = False
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
+
+        # ===== Stage-C: unfreeze spatial decoder last N layers (after warmup by default) =====
+        if (not is_single) and (not args.coco_pretrain) and (int(getattr(args, "unfreeze_decoder_last_n", 0)) > 0):
+            start_ep = int(getattr(args, "unfreeze_decoder_start_epoch", -1))
+            if start_ep < 0:
+                start_ep = int(getattr(args, "warmup_epochs", 0))
+
+            if (not stage_c_done) and (epoch >= start_ep):
+                n_last = int(getattr(args, "unfreeze_decoder_last_n", 0))
+                lr_dec = float(getattr(args, "lr_decoder", 1e-5))
+
+                new_params, lrng, new_names = unfreeze_spatial_decoder_last_layers(n_last)
+
+                if len(new_params) > 0:
+                    optimizer.add_param_group({
+                        "params": new_params,
+                        "lr": lr_dec,
+                        "weight_decay": args.weight_decay,
+                    })
+                    # Rebuild scheduler because MultiStepLR stores base_lrs per param_group at init
+                    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                        optimizer, milestones, last_epoch=epoch - 1
+                    )
+
+                stage_c_done = True
+                print(f"[stageC] start_epoch={start_ep}, unfreeze_last_n={n_last}, "
+                      f"layers={lrng}, lr_decoder={lr_dec}, new_params={len(new_params)}")
+                if len(new_names) > 0:
+                    print("[stageC] example unfrozen names:", new_names[:10])
 
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args
@@ -475,7 +547,6 @@ def main(args):
             }, epoch_ckpt_path)
 
         # ---- validate each epoch ----
-        # pass args/epoch so evaluate uses warmup alpha consistent with train
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
             args=args, epoch=epoch
@@ -541,7 +612,8 @@ def main(args):
             'val_map50': cur_ap50,
             'val_map5095': cur_ap5095,
             'epoch': epoch,
-            'n_parameters': n_parameters,
+            'n_parameters_total': n_total,
+            'n_parameters_trainable': n_trainable,
             'best_metric_name': 'mAP50',
             'best_metric': best_metric,
             'best_epoch': best_epoch,
