@@ -26,7 +26,7 @@ def run_multi():
     args.num_feature_levels = 1
     args.num_queries = 300
     args.dilation = True
-    args.batch_size = 4
+    args.batch_size = 1
     args.num_ref_frames = 3
     args.cqs_topk = 0  # 例如每帧筛到 100
     args.two_stage = True
@@ -45,7 +45,7 @@ def run_multi():
     args.warmup_enable = USE_WARMUP
     args.warmup_epochs = WARMUP_EPOCHS
     args.warmup_schedule = WARMUP_SCHEDULE
-    
+
     # ===== Stage-C: unfreeze spatial decoder last layers (after warmup) =====
     args.unfreeze_decoder_last_n = 2
     args.unfreeze_decoder_start_epoch = args.warmup_epochs  # warmup 结束后（epoch==5）开始

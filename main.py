@@ -508,6 +508,12 @@ def main(args):
                         "lr": lr_dec,
                         "weight_decay": args.weight_decay,
                     })
+
+                    # === FIX: make MultiStepLR happy when last_epoch != -1 ===
+                    for pg in optimizer.param_groups:
+                        if "initial_lr" not in pg:
+                            pg["initial_lr"] = pg["lr"]
+                   
                     # Rebuild scheduler because MultiStepLR stores base_lrs per param_group at init
                     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
                         optimizer, milestones, last_epoch=epoch - 1
