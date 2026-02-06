@@ -46,10 +46,10 @@ def get_args_parser():
                         help='use tri-modal query-fusion decoder for (VIS/IR/SAR)')
     parser.add_argument('--trimodal_fusion', default='avg', type=str,
                         choices=['avg', 'gated', 'concat', 'msd'],
-                        help='query-side fusion type; set to msd to use DAMSDet-style multispectral deformable decoder (treat modalities as extra feature levels)')
+                        help='query-side fusion type')
     parser.add_argument('--trimodal_fusion_multi', default='gated', type=str,
                         choices=['avg', 'gated', 'concat', 'msd'],
-                        help='fusion type for multi-frame (Stage-2) transformer decoder; default keeps historical behavior (gated). Set to msd to use DAMSDet-style multispectral deformable decoder.')
+                        help='fusion type for multi-frame (Stage-2) transformer decoder')
     parser.add_argument('--init_query_from_features', default=False, action='store_true',
                         help='init decoder tgt from topk encoder tokens (CQS-style)')
 
@@ -142,7 +142,7 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
-    # Stage-2 warmup (multi-frame): mix static and temporal outputs early to avoid degrading a strong Stage-1 baseline.
+    # Stage-2 warmup
     parser.add_argument('--warmup_enable', action='store_true',
                         help='enable warmup in Stage-2 training (mix static/temporal outputs)')
     parser.add_argument('--warmup_epochs', default=5, type=int,
@@ -151,7 +151,7 @@ def get_args_parser():
                         choices=['linear', 'cos'],
                         help='alpha schedule during warmup (linear or cosine)')
 
-    # Stage-2 progressive unfreeze (Stage-C): unfreeze spatial decoder last layers for higher upper bound
+    # Stage-C: decoder last N
     parser.add_argument('--unfreeze_decoder_last_n', default=0, type=int,
                         help='unfreeze last N layers of spatial decoder in Stage-2 (0 disables)')
     parser.add_argument('--unfreeze_decoder_start_epoch', default=-1, type=int,
@@ -159,13 +159,29 @@ def get_args_parser():
     parser.add_argument('--lr_decoder', default=1e-5, type=float,
                         help='learning rate for unfrozen spatial decoder layers')
 
+    # Stage-D: input_proj
+    parser.add_argument('--unfreeze_input_proj', action='store_true',
+                        help='unfreeze input_proj in Stage-2 (default False)')
+    parser.add_argument('--unfreeze_input_proj_start_epoch', default=-1, type=int,
+                        help='epoch to start unfreezing input_proj; -1 means warmup_epochs')
+    parser.add_argument('--lr_input_proj', default=1e-5, type=float,
+                        help='learning rate for input_proj when it is unfrozen')
+
+    # Stage-E: encoder last N
+    parser.add_argument('--unfreeze_encoder_last_n', default=0, type=int,
+                        help='unfreeze last N layers of spatial encoder in Stage-2 (0 disables)')
+    parser.add_argument('--unfreeze_encoder_start_epoch', default=-1, type=int,
+                        help='epoch to start unfreezing encoder last layers; -1 means warmup_epochs')
+    parser.add_argument('--lr_encoder', default=1e-5, type=float,
+                        help='learning rate for unfrozen encoder layers')
+
     return parser
 
 
 def main(args):
     print(args.dataset_file, 11111111)
 
-    # ===== single/multi 判定（vid_single_3m 也算 single） =====
+    # ===== single/multi 判定 =====
     is_single = args.dataset_file in ["vid_single", "vid_single_3m"]
 
     # choose engine/utils
@@ -175,9 +191,9 @@ def main(args):
     else:
         from engine_multi import evaluate, train_one_epoch
         if args.dataset_file == "vid_multi_3m":
-            import util.misc_multi_3m as utils   # 三模态多帧 split(9)
+            import util.misc_multi_3m as utils
         else:
-            import util.misc_multi as utils      # 原来的单模态 multi
+            import util.misc_multi as utils
 
     device = torch.device(args.device)
     utils.init_distributed_mode(args)
@@ -187,26 +203,33 @@ def main(args):
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
-    # fix the seed for reproducibility
+    # fix seed
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-    # ===== 显式按 is_single 构建模型 =====
+    # build model
     if is_single:
         model, criterion, postprocessors = build_single(args)
     else:
         model, criterion, postprocessors = build_multi(args)
 
     model.to(device)
+
+    # DDP wrap
     model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True
+        )
+        model_without_ddp = model.module
 
     print("[where-am-i] model class:", model_without_ddp.__class__)
     print("[where-am-i] transformer class:", model_without_ddp.transformer.__class__)
     print("[where-am-i] transformer module:", model_without_ddp.transformer.__class__.__module__)
 
-    # ===== dataset =====
+    # dataset
     dataset_train = build_dataset(image_set='train_vid', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
 
@@ -242,15 +265,20 @@ def main(args):
         pin_memory=True
     )
 
+    # base ds for eval
+    if args.dataset_file == "coco_panoptic":
+        coco_val = datasets.coco.build("val", args)
+        base_ds = get_coco_api_from_dataset(coco_val)
+    else:
+        base_ds = get_coco_api_from_dataset(dataset_val)
+
     def match_name_keywords(n, name_keywords):
         for b in name_keywords:
             if b in n:
                 return True
         return False
 
-    # ===== stage-C helpers =====
     def build_optimizer_and_scheduler():
-        # If lr_drop_epochs is None, fall back to [lr_drop]
         milestones = args.lr_drop_epochs
         if milestones is None:
             milestones = [int(args.lr_drop)]
@@ -290,14 +318,39 @@ def main(args):
         sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones)
         return opt, sch, milestones
 
-    def unfreeze_spatial_decoder_last_layers(n_last: int):
-        """
-        Unfreeze last n_last layers of spatial decoder:
-        names start with 'transformer.decoder.layers.{i}.'
-        """
-        if n_last <= 0:
-            return [], None
+    def unfreeze_input_proj():
+        prefixes = ("input_proj.",)
+        new_params, new_names = [], []
+        for name, p in model_without_ddp.named_parameters():
+            if name.startswith(prefixes) and (not p.requires_grad):
+                p.requires_grad = True
+                new_params.append(p)
+                new_names.append(name)
+        return new_params, new_names
 
+    def unfreeze_spatial_encoder_last_layers(n_last: int):
+        if n_last <= 0:
+            return [], None, []
+        enc = model_without_ddp.transformer.encoder
+        num_layers = int(getattr(enc, "num_layers", 0))
+        if num_layers <= 0:
+            num_layers = len(enc.layers)
+
+        start = max(0, num_layers - int(n_last))
+        end = num_layers - 1
+        prefixes = tuple([f"transformer.encoder.layers.{i}." for i in range(start, num_layers)])
+
+        new_params, new_names = [], []
+        for name, p in model_without_ddp.named_parameters():
+            if name.startswith(prefixes) and (not p.requires_grad):
+                p.requires_grad = True
+                new_params.append(p)
+                new_names.append(name)
+        return new_params, (start, end), new_names
+
+    def unfreeze_spatial_decoder_last_layers(n_last: int):
+        if n_last <= 0:
+            return [], None, []
         dec = model_without_ddp.transformer.decoder
         num_layers = int(getattr(dec, "num_layers", 0))
         if num_layers <= 0:
@@ -307,31 +360,15 @@ def main(args):
         end = num_layers - 1
         prefixes = tuple([f"transformer.decoder.layers.{i}." for i in range(start, num_layers)])
 
-        new_params = []
-        new_names = []
+        new_params, new_names = [], []
         for name, p in model_without_ddp.named_parameters():
-            if name.startswith(prefixes):
-                if not p.requires_grad:
-                    p.requires_grad = True
-                    new_params.append(p)
-                    new_names.append(name)
-
+            if name.startswith(prefixes) and (not p.requires_grad):
+                p.requires_grad = True
+                new_params.append(p)
+                new_names.append(name)
         return new_params, (start, end), new_names
 
-    # ===== DDP wrap (keep same as your original flow) =====
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True
-        )
-        model_without_ddp = model.module
-
-    # ===== base ds for eval =====
-    if args.dataset_file == "coco_panoptic":
-        coco_val = datasets.coco.build("val", args)
-        base_ds = get_coco_api_from_dataset(coco_val)
-    else:
-        base_ds = get_coco_api_from_dataset(dataset_val)
-
+    # frozen_weights (segm only)
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
@@ -349,67 +386,30 @@ def main(args):
 
         ckpt_sd_raw = checkpoint.get("model", checkpoint)
 
-        # ---- eval: load everything possible (key in model + shape match) ----
         if args.eval:
             model_sd_now = model_without_ddp.state_dict()
             eval_sd = {k: v for k, v in ckpt_sd_raw.items()
                        if (k in model_sd_now) and (model_sd_now[k].shape == v.shape)}
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(eval_sd, strict=False)
-
-        # ---- train ----
         else:
-            # freeze non-temporal params only when doing temporal finetune stage (coco_pretrain==False)
             if not args.coco_pretrain:
                 for name, param in model_without_ddp.named_parameters():
                     if ("temporal" in name) or name.startswith("temp_"):
                         param.requires_grad = True
                     else:
                         param.requires_grad = False
-
                 trainable = [n for n, p in model_without_ddp.named_parameters() if p.requires_grad]
                 frozen = [n for n, p in model_without_ddp.named_parameters() if not p.requires_grad]
                 print("[freeze-check] trainable:", len(trainable), "frozen:", len(frozen))
                 print("[freeze-check] first trainable:", trainable[:20])
 
-            # ---------- load by (key in model) AND (shape match) ----------
             model_sd = model_without_ddp.state_dict()
             load_sd = {k: v for k, v in ckpt_sd_raw.items()
                        if (k in model_sd) and (tuple(model_sd[k].shape) == tuple(v.shape))}
 
-            # ===== debug: resume coverage =====
-            in_model = [k for k in ckpt_sd_raw.keys() if k in model_sd]
-            not_in_model = [k for k in ckpt_sd_raw.keys() if k not in model_sd]
-            shape_mismatch = [k for k in in_model if tuple(ckpt_sd_raw[k].shape) != tuple(model_sd[k].shape)]
-            loadable = list(load_sd.keys())
-
-            print("====== [resume-debug] ckpt keys:", len(ckpt_sd_raw))
-            print("====== [resume-debug] model keys:", len(model_sd))
-            print("====== [resume-debug] ckpt keys in model:", len(in_model))
-            print("====== [resume-debug] ckpt keys NOT in model:", len(not_in_model))
-            print("====== [resume-debug] shape mismatch:", len(shape_mismatch))
-            print("====== [resume-debug] loadable(after key+shape):", len(loadable))
-
-            critical_prefix = ["backbone", "transformer", "input_proj", "bbox_embed", "class_embed", "temp"]
-            for pfx in critical_prefix:
-                c_in = sum(k.startswith(pfx) for k in ckpt_sd_raw.keys())
-                c_load = sum(k.startswith(pfx) for k in loadable)
-                print(f"====== [resume-debug] prefix={pfx:12s} ckpt={c_in:4d} loadable={c_load:4d}")
-
-            print("====== [resume-debug] examples NOT in model:", not_in_model[:20])
-            print("====== [resume-debug] examples shape mismatch:", shape_mismatch[:20])
-
-            denom = len([k for k in ckpt_sd_raw.keys() if k in model_sd])
-            if denom > 0 and len(loadable) < 0.7 * denom:
-                raise RuntimeError(
-                    "Resume coverage too low: most ckpt params are not loaded. "
-                    "Check key names / shapes."
-                )
-
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(load_sd, strict=False)
 
-            # ===== warm-start temp heads from Stage-1 heads when resuming single->multi =====
-            # IMPORTANT: when two_stage=True, class_embed/bbox_embed has (dec_layers+1) heads;
-            # the last one (-1) is for encoder proposals. We should copy from the LAST DECODER layer head.
+            # warm-start temp heads
             if (not args.coco_pretrain) and hasattr(model_without_ddp, "temp_class_embed"):
                 import torch.nn as nn
                 need = (missing_keys is not None) and any(
@@ -419,8 +419,6 @@ def main(args):
                 if need:
                     with torch.no_grad():
                         last_dec_id = model_without_ddp.transformer.decoder.num_layers - 1
-
-                        # class head (use decoder last layer head)
                         if isinstance(model_without_ddp.class_embed, nn.ModuleList):
                             src_cls = model_without_ddp.class_embed[last_dec_id]
                         else:
@@ -428,13 +426,11 @@ def main(args):
                         model_without_ddp.temp_class_embed.weight.copy_(src_cls.weight)
                         model_without_ddp.temp_class_embed.bias.copy_(src_cls.bias)
 
-                        # box head (use decoder last layer head)
                         if isinstance(model_without_ddp.bbox_embed, nn.ModuleList):
                             src_box = model_without_ddp.bbox_embed[last_dec_id]
                         else:
                             src_box = model_without_ddp.bbox_embed
                         model_without_ddp.temp_bbox_embed.load_state_dict(src_box.state_dict())
-
                     print("[warmstart] copied decoder(last) class_embed/bbox_embed -> temp_*")
 
         unexpected_keys = [
@@ -453,13 +449,14 @@ def main(args):
             args=args, epoch=args.start_epoch
         )
         if args.output_dir:
-            utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+            import util.misc as utils_any
+            utils_any.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
-    # ===== build optimizer/scheduler AFTER resume+freeze (critical for Stage-2 finetune) =====
+    # ===== build optimizer AFTER resume+freeze =====
     optimizer, lr_scheduler, milestones = build_optimizer_and_scheduler()
 
-    # ===== optimizer check =====
+    # checks
     opt_params = []
     for g in optimizer.param_groups:
         opt_params += list(g["params"])
@@ -470,13 +467,11 @@ def main(args):
     print("[opt-check] trainable params:", len(trainable_params))
     print("[opt-check] optimizer==trainable:", opt_params_set == trainable_set)
 
-    # total/trainable params log
     n_total = sum(p.numel() for p in model_without_ddp.parameters())
-    n_trainable = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
     print("number of params (total):", n_total)
-    print("number of params (trainable):", n_trainable)
+    print("number of params (trainable):", sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad))
 
-    # ===== training with per-epoch validation + best checkpoint + delete non-best epoch ckpt =====
+    # training
     print("Start training")
     start_time = time.time()
 
@@ -485,57 +480,87 @@ def main(args):
     best_epoch_ckpt_path = None
 
     stage_c_done = False
+    stage_d_done = False
+    stage_e_done = False
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
 
-        # ===== Stage-C: unfreeze spatial decoder last N layers (after warmup by default) =====
+        added_groups = 0
+
+        # Stage-D: input_proj
+        if (not is_single) and (not args.coco_pretrain) and bool(getattr(args, "unfreeze_input_proj", False)):
+            start_ep = int(getattr(args, "unfreeze_input_proj_start_epoch", -1))
+            if start_ep < 0:
+                start_ep = int(getattr(args, "warmup_epochs", 0))
+            if (not stage_d_done) and (epoch >= start_ep):
+                lr_ip = float(getattr(args, "lr_input_proj", 1e-5))
+                new_params, new_names = unfreeze_input_proj()
+                if len(new_params) > 0:
+                    optimizer.add_param_group({"params": new_params, "lr": lr_ip, "weight_decay": args.weight_decay})
+                    added_groups += 1
+                stage_d_done = True
+                print(f"[stageD] start_epoch={start_ep}, unfreeze=input_proj, lr_input_proj={lr_ip}, new_params={len(new_params)}")
+                if len(new_names) > 0:
+                    print("[stageD] example unfrozen names:", new_names[:10])
+
+        # Stage-E: encoder last N
+        if (not is_single) and (not args.coco_pretrain) and (int(getattr(args, "unfreeze_encoder_last_n", 0)) > 0):
+            start_ep = int(getattr(args, "unfreeze_encoder_start_epoch", -1))
+            if start_ep < 0:
+                start_ep = int(getattr(args, "warmup_epochs", 0))
+            if (not stage_e_done) and (epoch >= start_ep):
+                n_last = int(getattr(args, "unfreeze_encoder_last_n", 0))
+                lr_enc = float(getattr(args, "lr_encoder", 1e-5))
+                new_params, lrng, new_names = unfreeze_spatial_encoder_last_layers(n_last)
+                if len(new_params) > 0:
+                    optimizer.add_param_group({"params": new_params, "lr": lr_enc, "weight_decay": args.weight_decay})
+                    added_groups += 1
+                stage_e_done = True
+                print(f"[stageE] start_epoch={start_ep}, unfreeze_encoder_last_n={n_last}, layers={lrng}, lr_encoder={lr_enc}, new_params={len(new_params)}")
+                if len(new_names) > 0:
+                    print("[stageE] example unfrozen names:", new_names[:10])
+
+        # Stage-C: decoder last N (optional)
         if (not is_single) and (not args.coco_pretrain) and (int(getattr(args, "unfreeze_decoder_last_n", 0)) > 0):
             start_ep = int(getattr(args, "unfreeze_decoder_start_epoch", -1))
             if start_ep < 0:
                 start_ep = int(getattr(args, "warmup_epochs", 0))
-
             if (not stage_c_done) and (epoch >= start_ep):
                 n_last = int(getattr(args, "unfreeze_decoder_last_n", 0))
                 lr_dec = float(getattr(args, "lr_decoder", 1e-5))
-
                 new_params, lrng, new_names = unfreeze_spatial_decoder_last_layers(n_last)
-
                 if len(new_params) > 0:
-                    optimizer.add_param_group({
-                        "params": new_params,
-                        "lr": lr_dec,
-                        "weight_decay": args.weight_decay,
-                    })
-
-                    # === FIX: make MultiStepLR happy when last_epoch != -1 ===
-                    for pg in optimizer.param_groups:
-                        if "initial_lr" not in pg:
-                            pg["initial_lr"] = pg["lr"]
-                   
-                    # Rebuild scheduler because MultiStepLR stores base_lrs per param_group at init
-                    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                        optimizer, milestones, last_epoch=epoch - 1
-                    )
-
+                    optimizer.add_param_group({"params": new_params, "lr": lr_dec, "weight_decay": args.weight_decay})
+                    added_groups += 1
                 stage_c_done = True
-                print(f"[stageC] start_epoch={start_ep}, unfreeze_last_n={n_last}, "
-                      f"layers={lrng}, lr_decoder={lr_dec}, new_params={len(new_params)}")
+                print(f"[stageC] start_epoch={start_ep}, unfreeze_last_n={n_last}, layers={lrng}, lr_decoder={lr_dec}, new_params={len(new_params)}")
                 if len(new_names) > 0:
                     print("[stageC] example unfrozen names:", new_names[:10])
+
+        # rebuild scheduler if groups added
+        if added_groups > 0:
+            for pg in optimizer.param_groups:
+                if "initial_lr" not in pg:
+                    pg["initial_lr"] = pg["lr"]
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones, last_epoch=epoch - 1
+            )
+            n_trainable_now = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
+            print("[unfreeze] updated trainable params:", n_trainable_now)
 
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args
         )
         lr_scheduler.step()
 
-        print('args.output_dir', args.output_dir)
-
-        # ---- save regular checkpoints ----
+        # save checkpoints
         epoch_ckpt_path = None
         if args.output_dir:
-            utils.save_on_master({
+            import util.misc as utils_any
+            output_dir.mkdir(parents=True, exist_ok=True)
+            utils_any.save_on_master({
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
@@ -544,7 +569,7 @@ def main(args):
             }, output_dir / 'checkpoint.pth')
 
             epoch_ckpt_path = output_dir / f'checkpoint{epoch:04}.pth'
-            utils.save_on_master({
+            utils_any.save_on_master({
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
@@ -552,29 +577,25 @@ def main(args):
                 'args': args,
             }, epoch_ckpt_path)
 
-        # ---- validate each epoch ----
+        # validate
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
             args=args, epoch=epoch
         )
 
-        # ---- extract mAP50:95 and mAP50 ----
-        cur_ap5095 = None
         cur_ap50 = None
+        cur_ap5095 = None
         if isinstance(test_stats, dict) and ('coco_eval_bbox' in test_stats):
             try:
-                cur_ap5095 = float(test_stats['coco_eval_bbox'][0])  # mAP50:95
-                cur_ap50 = float(test_stats['coco_eval_bbox'][1])    # mAP50
+                cur_ap5095 = float(test_stats['coco_eval_bbox'][0])
+                cur_ap50 = float(test_stats['coco_eval_bbox'][1])
             except Exception:
                 cur_ap5095, cur_ap50 = None, None
 
-        # ---- choose best by mAP50 ----
         key_metric = cur_ap50
         is_best = False
-
         if (key_metric is not None) and args.output_dir and utils.is_main_process() and (key_metric > best_metric):
             is_best = True
-
             if best_epoch_ckpt_path is not None and best_epoch_ckpt_path.exists():
                 try:
                     best_epoch_ckpt_path.unlink()
@@ -585,7 +606,8 @@ def main(args):
             best_epoch = epoch
             best_epoch_ckpt_path = epoch_ckpt_path
 
-            utils.save_on_master({
+            import util.misc as utils_any
+            utils_any.save_on_master({
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
@@ -599,11 +621,10 @@ def main(args):
             }, output_dir / 'best.pth')
 
             try:
-                utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "best_eval.pth")
+                utils_any.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "best_eval.pth")
             except Exception:
                 pass
 
-        # ---- delete non-best epoch checkpoint ----
         if args.output_dir and utils.is_main_process():
             if (epoch_ckpt_path is not None) and (not is_best) and epoch_ckpt_path.exists():
                 try:
@@ -611,21 +632,20 @@ def main(args):
                 except Exception:
                     pass
 
-        # ---- log train + val metrics into log.txt ----
-        log_stats = {
-            **{f'train_{k}': v for k, v in train_stats.items()},
-            **{f'test_{k}': v for k, v in (test_stats.items() if isinstance(test_stats, dict) else [])},
-            'val_map50': cur_ap50,
-            'val_map5095': cur_ap5095,
-            'epoch': epoch,
-            'n_parameters_total': n_total,
-            'n_parameters_trainable': n_trainable,
-            'best_metric_name': 'mAP50',
-            'best_metric': best_metric,
-            'best_epoch': best_epoch,
-        }
-
         if args.output_dir and utils.is_main_process():
+            n_trainable_now = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
+            log_stats = {
+                **{f'train_{k}': v for k, v in train_stats.items()},
+                **{f'test_{k}': v for k, v in (test_stats.items() if isinstance(test_stats, dict) else [])},
+                'val_map50': cur_ap50,
+                'val_map5095': cur_ap5095,
+                'epoch': epoch,
+                'n_parameters_total': n_total,
+                'n_parameters_trainable': n_trainable_now,
+                'best_metric_name': 'mAP50',
+                'best_metric': best_metric,
+                'best_epoch': best_epoch,
+            }
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 

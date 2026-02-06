@@ -1,3 +1,4 @@
+
 import os
 import main as train_main
 
@@ -6,9 +7,8 @@ IR_PATH  = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/ir_root"
 SAR_PATH = "/mnt/f/Tri_modal_data/Temp_Tri_modal_data/sar_root"
 
 SINGLE_CKPT = "/mnt/d/Tri_modal_temp_code/TransVOD_model_pth/Tri_modal_single/best.pth"
-# "D:\Tri_modal_temp_code\TransVOD_model_pth\Tri_modal_single\best.pth"
+
 # -------- Stage-2 warmup (mode-1: output mixing) --------
-# Set USE_WARMUP=False to disable.
 USE_WARMUP = True
 WARMUP_EPOCHS = 5
 WARMUP_SCHEDULE = "linear"  # {linear, cos}
@@ -17,59 +17,69 @@ def run_multi():
     parser = train_main.get_args_parser()
     args = parser.parse_args([])
 
-    # ===== 关键：三模态多帧 =====
+    # ===== tri-modal multi-frame (Stage-2) =====
     args.dataset_file = "vid_multi_3m"
 
-    # ===== 对齐 r50_train_multi.sh（建议先验证用小配置）=====
+    # ===== align Stage-1 structure params =====
     args.backbone = "resnet50"
-    args.epochs = 1          # 验证阶段建议 1
+    args.epochs = 1
     args.num_feature_levels = 1
     args.num_queries = 300
     args.dilation = True
     args.batch_size = 1
     args.num_ref_frames = 3
-    args.cqs_topk = 0  # 例如每帧筛到 100
+    args.cqs_topk = 0
     args.two_stage = True
     args.tdam = True
     args.lr_drop_epochs = [30, 40]
-    args.num_workers = 0     # 验证阶段建议 0
+    args.num_workers = 0
     args.with_box_refine = True
     args.lr = 2e-4
-    args.trimodal_decoder = True     # SAME as Stage-1
-    args.trimodal_fusion = "msd"     # 保险起见，单帧/多帧都设
+
+    # tri-modal decoder / fusion (keep identical to Stage-1)
+    args.trimodal_decoder = True
+    args.trimodal_fusion = "msd"
     args.trimodal_fusion_multi = "msd"
+    args.init_query_from_features = True
 
-    args.init_query_from_features = True  # 建议 True，更贴近 DAMSDet CQS
-
-    # ===== Stage-2 warmup (mode-1) =====
+    # ===== warmup =====
     args.warmup_enable = USE_WARMUP
     args.warmup_epochs = WARMUP_EPOCHS
     args.warmup_schedule = WARMUP_SCHEDULE
 
-    # ===== Stage-C: unfreeze spatial decoder last layers (after warmup) =====
-    args.unfreeze_decoder_last_n = 2
-    args.unfreeze_decoder_start_epoch = args.warmup_epochs  # warmup 结束后（epoch==5）开始
+    # ===== Stage-D/E: progressive unfreeze for higher upper bound =====
+    # Stage-D: unfreeze input_proj (shared projection convs)
+    args.unfreeze_input_proj = True
+    args.unfreeze_input_proj_start_epoch = args.warmup_epochs  # after warmup by default
+    args.lr_input_proj = 2e-5
+
+    # Stage-E: unfreeze encoder last 1 layer (spatial encoder)
+    args.unfreeze_encoder_last_n = 1
+    args.unfreeze_encoder_start_epoch = args.warmup_epochs + 5  # delay for stability
+    args.lr_encoder = 2e-5
+
+    # (optional) Stage-C decoder unfreeze (disable here; set >0 if you also want C)
+    args.unfreeze_decoder_last_n = 0
+    args.unfreeze_decoder_start_epoch = args.warmup_epochs
     args.lr_decoder = 1e-5
 
-
-    # ===== 三路数据根目录分别设置 =====
+    # ===== data roots =====
     args.vid_path = VIS_PATH
     args.vid_path_ir = IR_PATH
     args.vid_path_sar = SAR_PATH
     args.num_classes = 3
 
-    # ===== 从单帧初始化 =====
-    args.coco_pretrain = False # 冻结非时序的参数
-    args.resume = SINGLE_CKPT # 从一个已有 checkpoint 恢复/初始化模型参数
+    # ===== init from Stage-1 =====
+    args.coco_pretrain = False
+    args.resume = SINGLE_CKPT
 
-    # ===== 验证阶段：只跑 eval 更快（可保留）=====
+    # ===== train =====
     args.eval = False
 
-    # ===== 输出 =====
-    args.output_dir = "exps/multibaseline/mydata_stage2"
+    # ===== output =====
+    args.output_dir = "exps/multibaseline/v6_mydata_stage2_warmup_DE"
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ===== 设备 =====
     args.device = "cuda"
 
     train_main.main(args)
