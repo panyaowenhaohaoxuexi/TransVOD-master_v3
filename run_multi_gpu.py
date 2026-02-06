@@ -58,6 +58,15 @@ def run_multi():
     args.unfreeze_encoder_start_epoch = args.warmup_epochs + 5  # delay for stability
     args.lr_encoder = 2e-5
 
+    # ===== Stage-F: unfreeze ALL params after temporal stabilizes =====
+    # If you want an immediate full finetune, set start_epoch=0.
+    args.unfreeze_all = True
+    args.unfreeze_all_start_epoch = args.warmup_epochs + 10  # typical: warmup + 10
+    args.lr_unfreeze_all = 2e-5
+    args.lr_unfreeze_all_backbone = 5e-5
+    args.lr_unfreeze_all_linear_proj = 1e-5
+
+
     # (optional) Stage-C decoder unfreeze (disable here; set >0 if you also want C)
     args.unfreeze_decoder_last_n = 0
     args.unfreeze_decoder_start_epoch = args.warmup_epochs

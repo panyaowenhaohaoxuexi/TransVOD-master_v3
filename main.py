@@ -175,6 +175,19 @@ def get_args_parser():
     parser.add_argument('--lr_encoder', default=1e-5, type=float,
                         help='learning rate for unfrozen encoder layers')
 
+
+    # Stage-F: unfreeze ALL remaining frozen params (full finetune after temporal stabilizes)
+    parser.add_argument('--unfreeze_all', action='store_true',
+                        help='unfreeze all remaining frozen params in Stage-2 (full finetune)')
+    parser.add_argument('--unfreeze_all_start_epoch', default=-1, type=int,
+                        help='epoch to start unfreezing all; -1 means warmup_epochs+5')
+    parser.add_argument('--lr_unfreeze_all', default=2e-5, type=float,
+                        help='learning rate for newly-unfrozen (non-backbone) params in Stage-F')
+    parser.add_argument('--lr_unfreeze_all_backbone', default=5e-6, type=float,
+                        help='learning rate for backbone params in Stage-F')
+    parser.add_argument('--lr_unfreeze_all_linear_proj', default=1e-5, type=float,
+                        help='learning rate for linear proj params (reference_points/sampling_offsets) in Stage-F')
+
     return parser
 
 
@@ -368,6 +381,40 @@ def main(args):
                 new_names.append(name)
         return new_params, (start, end), new_names
 
+    def unfreeze_all_remaining(keep_bn_frozen: bool = False):
+        """
+        Stage-F: unfreeze everything still frozen (requires_grad==False), and return grouped params.
+        Grouping follows existing lr policies:
+          - backbone params (match lr_backbone_names) -> lr_unfreeze_all_backbone
+          - linear proj params (match lr_linear_proj_names) -> lr_unfreeze_all_linear_proj
+          - others -> lr_unfreeze_all
+        """
+        new_base, new_bb, new_lp = [], [], []
+        names_base, names_bb, names_lp = [], [], []
+
+        for name, p in model_without_ddp.named_parameters():
+            if p.requires_grad:
+                continue
+
+            if keep_bn_frozen:
+                if ('.bn' in name) or ('bn' in name and 'backbone' in name):
+                    continue
+
+            p.requires_grad = True
+
+            if match_name_keywords(name, args.lr_backbone_names):
+                new_bb.append(p)
+                names_bb.append(name)
+            elif match_name_keywords(name, args.lr_linear_proj_names):
+                new_lp.append(p)
+                names_lp.append(name)
+            else:
+                new_base.append(p)
+                names_base.append(name)
+
+        return (new_base, new_bb, new_lp), (names_base, names_bb, names_lp)
+
+
     # frozen_weights (segm only)
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
@@ -482,6 +529,7 @@ def main(args):
     stage_c_done = False
     stage_d_done = False
     stage_e_done = False
+    stage_f_done = False
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -538,6 +586,44 @@ def main(args):
                 print(f"[stageC] start_epoch={start_ep}, unfreeze_last_n={n_last}, layers={lrng}, lr_decoder={lr_dec}, new_params={len(new_params)}")
                 if len(new_names) > 0:
                     print("[stageC] example unfrozen names:", new_names[:10])
+
+
+        # Stage-F: unfreeze ALL remaining frozen params (full finetune) after temporal stabilizes
+        if (not is_single) and (not args.coco_pretrain) and bool(getattr(args, "unfreeze_all", False)):
+            start_ep = int(getattr(args, "unfreeze_all_start_epoch", -1))
+            if start_ep < 0:
+                start_ep = int(getattr(args, "warmup_epochs", 0)) + 5
+
+            if (not stage_f_done) and (epoch >= start_ep):
+                lr_all = float(getattr(args, "lr_unfreeze_all", 2e-5))
+                lr_all_bb = float(getattr(args, "lr_unfreeze_all_backbone", 5e-6))
+                lr_all_lp = float(getattr(args, "lr_unfreeze_all_linear_proj", 1e-5))
+
+                (new_base, new_bb, new_lp), (names_base, names_bb, names_lp) = unfreeze_all_remaining(
+                    keep_bn_frozen=False
+                )
+
+                if len(new_base) > 0:
+                    optimizer.add_param_group({"params": new_base, "lr": lr_all, "weight_decay": args.weight_decay})
+                    added_groups += 1
+                if len(new_bb) > 0:
+                    optimizer.add_param_group({"params": new_bb, "lr": lr_all_bb, "weight_decay": args.weight_decay})
+                    added_groups += 1
+                if len(new_lp) > 0:
+                    optimizer.add_param_group({"params": new_lp, "lr": lr_all_lp, "weight_decay": args.weight_decay})
+                    added_groups += 1
+
+                stage_f_done = True
+
+                n_new = len(new_base) + len(new_bb) + len(new_lp)
+                print(f"[stageF] start_epoch={start_ep}, unfreeze=ALL, "
+                      f"new_params={n_new}, lr_all={lr_all}, lr_backbone={lr_all_bb}, lr_linear_proj={lr_all_lp}")
+                if len(names_bb) > 0:
+                    print("[stageF] example backbone names:", names_bb[:10])
+                if len(names_base) > 0:
+                    print("[stageF] example base names:", names_base[:10])
+                if len(names_lp) > 0:
+                    print("[stageF] example linear-proj names:", names_lp[:10])
 
         # rebuild scheduler if groups added
         if added_groups > 0:

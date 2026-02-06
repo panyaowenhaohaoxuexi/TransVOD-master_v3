@@ -1,0 +1,1 @@
+多帧时序训练的时候，解冻 input_proj + encoder 最后一层
